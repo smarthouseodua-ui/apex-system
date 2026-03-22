@@ -1,12 +1,13 @@
 """
 APEX PROTOCOL™ — Scanner
-Сканирует рынок, находит кандидатов для торговли.
+Сканирует рынок, находит кандидатов. Пишет в SKL01_T01_scanner_log.
 """
 
 import logging
 from datetime import datetime
 from core.event_bus import EventBus
 from services.exchange_service import ExchangeService
+from storage.db.repository import Repository
 
 logger = logging.getLogger("apex.scanner")
 
@@ -17,6 +18,7 @@ class Scanner:
         self.config = config
         self.event_bus = event_bus
         self.exchange_service = ExchangeService(config)
+        self.repo = Repository()
         self._connected = False
 
     async def _ensure_connected(self):
@@ -29,6 +31,8 @@ class Scanner:
             await self._ensure_connected()
             candidates = await self._fetch_candidates()
             filtered = self._filter(candidates)
+            for c in filtered:
+                self.repo.log_scanner(c)
             logger.info(f"Scanner: {len(filtered)}/{len(candidates)} candidates passed filter")
             await self.event_bus.publish("scanner.done", {"candidates": filtered})
             return filtered
@@ -39,14 +43,12 @@ class Scanner:
     async def _fetch_candidates(self) -> list:
         tickers = await self.exchange_service.get_tickers()
         candidates = []
-
         for symbol, ticker in tickers.items():
             try:
                 price = ticker.get("last", 0)
                 volume = ticker.get("quoteVolume", 0)
                 high = ticker.get("high", price)
                 low = ticker.get("low", price)
-
                 if price and price > 0:
                     volatility = round(((high - low) / price) * 100, 4)
                     candidates.append({
@@ -60,7 +62,6 @@ class Scanner:
                     })
             except Exception:
                 continue
-
         return candidates
 
     def _filter(self, candidates: list) -> list:
@@ -79,6 +80,5 @@ class Scanner:
             and c.get("symbol", "").endswith(f":{quote_currency}")
             and c.get("symbol") not in blacklist
         ]
-
         result.sort(key=lambda x: x.get("volume", 0), reverse=True)
         return result[:max_candidates]

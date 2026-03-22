@@ -1,11 +1,12 @@
 """
 APEX PROTOCOL™ — Position Manager
-Мониторинг открытых позиций, трейлинг SL, частичное закрытие.
+Мониторинг позиций. Пишет в SKL01_T06_position_manager_log.
 """
 
 import logging
 from datetime import datetime
 from core.event_bus import EventBus
+from storage.db.repository import Repository
 
 logger = logging.getLogger("apex.position_manager")
 
@@ -15,15 +16,16 @@ class PositionManager:
     def __init__(self, config: dict, event_bus: EventBus):
         self.config = config
         self.event_bus = event_bus
-        self._positions = {}  # symbol → position
+        self.repo = Repository()
+        self._positions = {}
 
     async def monitor(self, positions: list) -> None:
-        """Мониторинг списка позиций."""
         try:
             for position in positions:
                 symbol = position.get("symbol")
                 self._positions[symbol] = position
                 await self._check_position(position)
+                self.repo.log_position(position)
 
             logger.info(f"PositionManager: monitoring {len(self._positions)} positions")
             await self.event_bus.publish("position_manager.update", {
@@ -33,12 +35,11 @@ class PositionManager:
             logger.error(f"PositionManager error: {e}", exc_info=True)
 
     async def _check_position(self, position: dict) -> None:
-        """Проверка условий позиции: TP1/TP2/TP3/SL."""
         symbol = position.get("symbol")
         current_price = position.get("current_price", position.get("entry"))
         direction = position.get("direction", "long")
 
-        sl = position.get("sl")
+        sl  = position.get("sl")
         tp1 = position.get("tp1")
         tp2 = position.get("tp2")
         tp3 = position.get("tp3")
@@ -63,7 +64,6 @@ class PositionManager:
                 await self._close_position(position, "TP1")
 
     async def _close_position(self, position: dict, reason: str) -> None:
-        """Отметить позицию на закрытие."""
         symbol = position.get("symbol")
         position["close_reason"] = reason
         position["closed_at"] = datetime.now().isoformat()

@@ -1,18 +1,17 @@
 """
 APEX PROTOCOL™ — Strategy Engine
 Каркас. Временная тестовая стратегия: Session ORB 5m.
-Логика: первая 5м свеча сессии → High/Low → пробой = сигнал.
-Сессии: 08:00, 12:00, 17:00
+Пишет в SKL01_T02_strategy_log.
 """
 
 import logging
 from datetime import datetime
 from core.event_bus import EventBus
 from services.exchange_service import ExchangeService
+from storage.db.repository import Repository
 
 logger = logging.getLogger("apex.strategy_engine")
 
-# Часы открытия сессий (UTC+1 Podgorica)
 SESSION_OPEN_HOURS = [8, 12, 17]
 
 
@@ -22,8 +21,8 @@ class StrategyEngine:
         self.config = config
         self.event_bus = event_bus
         self.exchange_service = ExchangeService(config)
+        self.repo = Repository()
         self._connected = False
-        self._session_ranges = {}  # symbol → {high, low, session_hour}
 
     async def _ensure_connected(self):
         if not self._connected:
@@ -31,7 +30,6 @@ class StrategyEngine:
             self._connected = True
 
     def _current_session_hour(self) -> int | None:
-        """Возвращает час сессии если мы в первые 5 минут после открытия."""
         now = datetime.now()
         if now.hour in SESSION_OPEN_HOURS and now.minute < 5:
             return now.hour
@@ -52,6 +50,7 @@ class StrategyEngine:
             for candidate in candidates:
                 signal = await self._session_orb_signal(candidate, session_hour)
                 if signal:
+                    self.repo.log_strategy(signal)
                     signals.append(signal)
 
             logger.info(f"StrategyEngine: {len(signals)} signals generated")
@@ -62,25 +61,19 @@ class StrategyEngine:
             return []
 
     async def _session_orb_signal(self, candidate: dict, session_hour: int) -> dict | None:
-        """
-        Тестовая стратегия Session ORB 5m.
-        Берём первую 5м свечу сессии → High/Low → пробой текущей цены.
-        """
         symbol = candidate["symbol"]
         try:
             candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=3)
             if len(candles) < 2:
                 return None
 
-            # Первая свеча сессии
             session_candle = candles[0]
-            orb_high = session_candle[2]  # high
-            orb_low  = session_candle[3]  # low
+            orb_high = session_candle[2]
+            orb_low  = session_candle[3]
 
             if orb_high <= orb_low:
                 return None
 
-            # Текущая цена
             current_price = candidate["price"]
 
             direction = None
@@ -109,7 +102,6 @@ class StrategyEngine:
                 "confidence": 1.0,
                 "generated_at": datetime.now().isoformat()
             }
-
         except Exception as e:
             logger.error(f"Session ORB error {symbol}: {e}")
             return None
