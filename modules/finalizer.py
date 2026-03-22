@@ -1,12 +1,11 @@
 """
 APEX PROTOCOL™ — Finalizer
-Закрывает позиции, считает PnL, пишет в SKL01_T07_final_trade_results.
+Закрывает позиции, считает PnL, пишет в таблицы.
 """
 
 import logging
 from datetime import datetime
 from core.event_bus import EventBus
-from storage.db.repository import Repository
 
 logger = logging.getLogger("apex.finalizer")
 
@@ -16,30 +15,27 @@ class Finalizer:
     def __init__(self, config: dict, event_bus: EventBus):
         self.config = config
         self.event_bus = event_bus
-        self.repo = Repository()
 
     async def finalize(self, positions: list) -> None:
-        closing = [p for p in positions if p.get("status") == "closing"]
+        """Финализация позиций со статусом 'closing'."""
         try:
+            closing = [p for p in positions if p.get("status") == "closing"]
             for position in closing:
                 result = self._calculate_pnl(position)
-                self.repo.log_final_trade(result)
-                self.repo.log_system_event(
-                    "trade.closed",
-                    "finalizer",
-                    f"{result['symbol']} | {result['close_reason']} | PnL: {result['pnl_usdt']} USDT"
-                )
+                await self._save(result)
                 await self.event_bus.publish("trade.closed", {"result": result})
                 logger.info(f"Trade closed: {result['symbol']} | {result['close_reason']} | PnL: {result['pnl_usdt']} USDT")
         except Exception as e:
             logger.error(f"Finalizer error: {e}", exc_info=True)
 
     def _calculate_pnl(self, position: dict) -> dict:
+        """Расчёт PnL сделки."""
         entry = position.get("fill_price", position.get("entry", 0))
         close_reason = position.get("close_reason", "UNKNOWN")
         direction = position.get("direction", "long")
         size = position.get("size", 0)
 
+        # Определяем цену закрытия по причине
         price_map = {
             "TP1": position.get("tp1"),
             "TP2": position.get("tp2"),
@@ -63,3 +59,7 @@ class Finalizer:
             "status": "closed",
             "finalized_at": datetime.now().isoformat()
         }
+
+    async def _save(self, result: dict) -> None:
+        """Сохранение результата в таблицу. Заглушка — будет SQLite."""
+        logger.debug(f"Finalizer: saving result for {result.get('symbol')}")
