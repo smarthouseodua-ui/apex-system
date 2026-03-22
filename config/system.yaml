@@ -3,24 +3,31 @@
 system:
   name: "APEX PROTOCOL™"
   version: "1.0.0"
-  mode: "simulation"          # simulation / live
-  cycle_interval: 60          # секунд между циклами
+  mode: "simulation"
+  cycle_interval: 60
   timezone: "Europe/Podgorica"
 
 scanner:
-  min_volume: 1000000         # минимальный объём USDT
-  min_volatility: 0.5         # минимальная волатильность %
-  max_candidates: 20          # максимум кандидатов за цикл
+  min_volume: 50000000
+  min_volatility: 0.5
+  max_volatility: 15.0
+  max_candidates: 20
+  quote_currency: "USDT"      # только USDT пары
+  blacklist:
+    - "DOGE/USDT:USDT"
+    - "RIVER/USDT:USDT"
+    - "G/USDT:USDT"
+    - "SPX/USDT:USDT"
 
 signal_gate:
-  cooldown_minutes: 15        # cooldown между сигналами по паре
-  max_positions: 5            # максимум одновременных позиций
+  cooldown_minutes: 15
+  max_positions: 5
 
 risk:
-  balance_usdt: 1000          # виртуальный баланс (simulation)
-  risk_per_trade_pct: 1.0     # риск на сделку %
-  leverage: 10                # плечо
-  rr_ratio: 2.0               # минимальный RR
+  balance_usdt: 1000
+  risk_per_trade_pct: 1.0
+  leverage: 10
+  rr_ratio: 2.0
 
 logging:
   level: "INFO"
