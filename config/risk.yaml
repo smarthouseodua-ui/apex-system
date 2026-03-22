@@ -1,0 +1,38 @@
+# APEX PROTOCOL™ — Risk Config
+
+risk:
+  # Баланс и риск
+  balance_usdt: 1000
+  risk_per_trade_pct: 1.0     # % баланса на сделку
+  max_daily_loss_pct: 5.0     # максимальный дневной убыток %
+  max_drawdown_pct: 15.0      # максимальная просадка %
+
+  # Позиция
+  leverage: 10
+  rr_ratio: 2.0               # минимальный RR для входа
+  max_positions: 5            # максимум одновременных позиций
+
+  # TP распределение (% от позиции)
+  tp1_close_pct: 50           # закрыть 50% на TP1
+  tp2_close_pct: 30           # закрыть 30% на TP2
+  tp3_close_pct: 20           # закрыть 20% на TP3
+
+  # Trailing SL
+  trailing_sl_enabled: false
+  trailing_sl_activation: 1.0 # активировать после +1R
+  trailing_sl_step: 0.5       # шаг трейлинга
+
+  # Сессионные ограничения
+  blocked_hours: [13]         # блокировать час 13:xx UTC
+  allowed_sessions: ["HONG_KONG", "LONDON", "NEW_YORK", "ASIA"]
+
+  # Сессионные фильтры (направление)
+  session_filters:
+    HONG_KONG:
+      direction: "buy"        # WR 72.5% long
+    NEW_YORK:
+      direction: "sell"       # WR 55.2% short
+    LONDON:
+      direction: "both"
+    ASIA:
+      direction: "both"

@@ -1,0 +1,23 @@
+# APEX PROTOCOL™ — Exchanges Config
+
+exchanges:
+  binance_futures:
+    enabled: true
+    mode: "simulation"        # simulation / live
+    api_key: ""               # заполнить в .env
+    api_secret: ""            # заполнить в .env
+    testnet: false
+    markets: "futures"
+    quote_currency: "USDT"
+    fee: 0.0004               # 0.04% maker/taker
+
+  bybit:
+    enabled: false
+    mode: "simulation"
+    api_key: ""
+    api_secret: ""
+    markets: "futures"
+    quote_currency: "USDT"
+    fee: 0.0006
+
+default_exchange: "binance_futures"

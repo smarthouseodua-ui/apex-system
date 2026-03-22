@@ -1,0 +1,29 @@
+# APEX PROTOCOL™ — System Config
+
+system:
+  name: "APEX PROTOCOL™"
+  version: "1.0.0"
+  mode: "simulation"          # simulation / live
+  cycle_interval: 60          # секунд между циклами
+  timezone: "Europe/Podgorica"
+
+scanner:
+  min_volume: 1000000         # минимальный объём USDT
+  min_volatility: 0.5         # минимальная волатильность %
+  max_candidates: 20          # максимум кандидатов за цикл
+
+signal_gate:
+  cooldown_minutes: 15        # cooldown между сигналами по паре
+  max_positions: 5            # максимум одновременных позиций
+
+risk:
+  balance_usdt: 1000          # виртуальный баланс (simulation)
+  risk_per_trade_pct: 1.0     # риск на сделку %
+  leverage: 10                # плечо
+  rr_ratio: 2.0               # минимальный RR
+
+logging:
+  level: "INFO"
+  file: "logs/system.log"
+  trades_file: "logs/trades.log"
+  errors_file: "logs/errors.log"
