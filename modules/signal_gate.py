@@ -17,13 +17,18 @@ class SignalGate:
         self.config = config
         self.event_bus = event_bus
         self.repo = Repository()
-        self._recent_signals = {}
+        self._recent_signals: dict[str, datetime] = {}
 
-    async def filter(self, signals: list) -> list:
+    def reset(self):
+        """Сбросить состояние в начале каждого цикла."""
+        self._recent_signals.clear()
+        logger.info("SignalGate: reset — _recent_signals cleared")
+
+    async def filter(self, signals: list, open_symbols: set = None) -> list:
         try:
             approved = []
             for signal in signals:
-                ok, reason = self._check(signal)
+                ok, reason = self._check(signal, open_symbols or set())
                 self.repo.log_signal_gate(signal["symbol"], ok, reason)
                 if ok:
                     approved.append(signal)
@@ -36,17 +41,25 @@ class SignalGate:
             logger.error(f"SignalGate error: {e}", exc_info=True)
             return []
 
-    def _check(self, signal: dict) -> tuple[bool, str]:
+    def _check(self, signal: dict, open_symbols: set) -> tuple[bool, str]:
         symbol = signal.get("symbol")
-        cooldown = self.config.get("signal_gate", {}).get("cooldown_minutes", 15)
-        max_positions = self.config.get("signal_gate", {}).get("max_positions", 5)
+        max_pos = self.config.get("max_positions", 100)
+        cooldown_minutes = self.config.get("cooldown_minutes", 15)
+
+        # Блокировка: символ уже в открытых позициях
+        if symbol in open_symbols:
+            return False, "already_open"
+
+        db_open = self.repo.get_open_symbols()
+        if symbol in db_open:
+            return False, "already_open_db"
 
         if symbol in self._recent_signals:
-            elapsed = (datetime.now() - self._recent_signals[symbol]).seconds / 60
-            if elapsed < cooldown:
-                return False, f"cooldown ({elapsed:.1f}m < {cooldown}m)"
+            elapsed = (datetime.now() - self._recent_signals[symbol]).total_seconds() / 60
+            if elapsed < cooldown_minutes:
+                return False, f"cooldown ({elapsed:.1f}m < {cooldown_minutes}m)"
 
-        if len(self._recent_signals) >= max_positions:
-            return False, f"max_positions reached ({max_positions})"
+        if len(self._recent_signals) >= max_pos:
+            return False, f"max_positions reached ({max_pos})"
 
         return True, ""

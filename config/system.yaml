@@ -11,7 +11,7 @@ scanner:
   min_volume: 50000000
   min_volatility: 0.5
   max_volatility: 15.0
-  max_candidates: 20
+  max_candidates: 100
   quote_currency: "USDT"      # только USDT пары
   blacklist:
     - "DOGE/USDT:USDT"
@@ -19,9 +19,14 @@ scanner:
     - "G/USDT:USDT"
     - "SPX/USDT:USDT"
 
+cycle_interval: 15
+
+max_positions: 100
+cooldown_minutes: 15
+
 signal_gate:
   cooldown_minutes: 15
-  max_positions: 5
+  max_positions: 100
 
 risk:
   balance_usdt: 1000
