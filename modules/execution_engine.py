@@ -16,32 +16,36 @@ from core.time_manager import time_features_for_dt
 logger = logging.getLogger("apex.execution_engine")
 
 
-def _build_session_label(tf: dict) -> str:
-    """Человекочитаемая метка сессии по флагам из time_features_for_dt."""
+def _resolve_session(tf: dict) -> tuple[str, str]:
+    """Возвращает (session_name, session_label) по флагам из time_features_for_dt.
+
+    session_name  — для БД: ASIA, ASIA+HK, HONG_KONG, LONDON, LONDON+NY, NEW_YORK, OFF
+    session_label — человекочитаемая метка с уточнением (OPEN) и т.д.
+    """
     asia     = tf.get("session_asia", 0)
+    hk       = tf.get("session_hong_kong", 0)
     london   = tf.get("session_london", 0)
     new_york = tf.get("session_new_york", 0)
-    hk_open      = tf.get("event_hk_open", 0)
-    lon_open     = tf.get("event_london_open", 0)
-    ny_open      = tf.get("event_ny_open", 0)
+    lon_open = tf.get("event_london_open", 0)
+    ny_open  = tf.get("event_ny_open", 0)
 
-    # 1. Overlap London + NY — высший приоритет
-    if london and new_york:
-        return "LONDON (NY)"
-
-    # 2. Asia (с уточнением HK)
-    if asia:
-        return "ASIA (HK)" if hk_open else "ASIA"
-
-    # 3. London
-    if london:
-        return "LONDON (OPEN)" if lon_open else "LONDON"
-
-    # 4. New York
-    if new_york:
-        return "NEW YORK (OPEN)" if ny_open else "NEW YORK"
-
-    return "OFF"
+    if asia and hk:
+        return "ASIA+HK", "ASIA (HK)"
+    elif asia:
+        return "ASIA", "ASIA"
+    elif london and new_york:
+        label = "LONDON+NY (OPEN)" if ny_open else "LONDON+NY"
+        return "LONDON+NY", label
+    elif london:
+        label = "LONDON (OPEN)" if lon_open else "LONDON"
+        return "LONDON", label
+    elif new_york:
+        label = "NEW YORK (OPEN)" if ny_open else "NEW YORK"
+        return "NEW_YORK", label
+    elif hk:
+        return "HONG_KONG", "HONG KONG"
+    else:
+        return "OFF", "OFF"
 
 
 class ExecutionEngine:
@@ -86,19 +90,7 @@ class ExecutionEngine:
         trade_id = self.id_manager.next_trade_id() if self.id_manager else None
         opened_at = datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S")
         time_features = time_features_for_dt(opened_at)
-        session_label = _build_session_label(time_features)
-
-        asia     = time_features.get("session_asia", 0)
-        london   = time_features.get("session_london", 0)
-        new_york = time_features.get("session_new_york", 0)
-        if asia:
-            session_name = "ASIA"
-        elif london:
-            session_name = "LONDON"
-        elif new_york:
-            session_name = "NEW_YORK"
-        else:
-            session_name = "OFF"
+        session_name, session_label = _resolve_session(time_features)
 
         return {
             **order,

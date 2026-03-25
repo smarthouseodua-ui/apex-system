@@ -12,43 +12,53 @@ logger = logging.getLogger("apex.time_manager")
 
 TZ = ZoneInfo("Europe/Podgorica")
 
+# ── Все времена в UTC+2 (Europe/Podgorica) ───────────────────────────────────
+
+# Базовые окна сессий (в минутах от полуночи)
+_SESSION_WINDOWS = {
+    "session_asia":      (1 * 60,        10 * 60),      # 01:00–10:00  Токио
+    "session_hong_kong": (3 * 60,        12 * 60),      # 03:00–12:00  Гонконг
+    "session_london":    (10 * 60,       19 * 60),      # 10:00–19:00  Лондон
+    "session_new_york":  (15 * 60 + 30,  22 * 60),      # 15:30–22:00  Нью-Йорк
+}
+
+_SESSION_LABELS = {
+    "session_asia":      "ASIA",
+    "session_hong_kong": "HONG_KONG",
+    "session_london":    "LONDON",
+    "session_new_york":  "NEW_YORK",
+}
+
+# SESSIONS — для TimeManager.current_session() и handlers.py (часы, Podgorica)
 SESSIONS = {
-    "ASIA":      {"start": 0,  "end": 4},
-    "HONG_KONG": {"start": 4,  "end": 8},
-    "LONDON":    {"start": 8,  "end": 13},
-    "NEW_YORK":  {"start": 13, "end": 22},
-    "OFF":       {"start": 22, "end": 24},
+    "ASIA":      {"start": 1,  "end": 10},   # 01:00–10:00
+    "ASIA+HK":   {"start": 3,  "end": 10},   # 03:00–10:00  overlap
+    "HONG_KONG": {"start": 3,  "end": 12},   # 03:00–12:00
+    "LONDON":    {"start": 10, "end": 19},    # 10:00–19:00
+    "LONDON+NY": {"start": 15, "end": 19},    # 15:30–19:00  overlap
+    "NEW_YORK":  {"start": 15, "end": 22},    # 15:30–22:00
+    "OFF":       {"start": 22, "end": 1},
 }
 
 # Направление торговли по сессии
 SESSION_DIRECTION = {
-    "HONG_KONG": "buy",
-    "NEW_YORK":  "sell",
-    "LONDON":    "both",
     "ASIA":      "both",
+    "ASIA+HK":   "both",
+    "HONG_KONG": "buy",
+    "LONDON":    "both",
+    "LONDON+NY": "both",
+    "NEW_YORK":  "sell",
     "OFF":       "none",
-}
-
-# Сессионные окна для time_features (в минутах от полуночи, Europe/Podgorica)
-_SESSION_WINDOWS = {
-    "session_asia":      (1 * 60,       9 * 60),       # 01:00–09:00
-    "session_london":    (9 * 60,       18 * 60),      # 09:00–18:00
-    "session_new_york":  (14 * 60 + 30, 23 * 60),      # 14:30–23:00
-}
-
-_SESSION_LABELS = {
-    "session_asia":     "ASIA",
-    "session_london":   "LONDON",
-    "session_new_york": "NEW_YORK",
 }
 
 # Event-окна для time_features (в минутах от полуночи, Europe/Podgorica)
 _EVENT_WINDOWS = {
-    "event_tokyo_open":        (1 * 60,       2 * 60),       # 01:00–02:00
-    "event_hk_open":           (2 * 60 + 30,  3 * 60 + 30),  # 02:30–03:30
-    "event_london_open":       (9 * 60,       10 * 60),      # 09:00–10:00
-    "event_ny_open":           (14 * 60 + 30, 15 * 60 + 30), # 14:30–15:30
-    "event_overlap_london_ny": (14 * 60 + 30, 17 * 60),      # 14:30–17:00
+    "event_tokyo_open":        (1 * 60,        2 * 60),       # 01:00–02:00
+    "event_hk_open":           (3 * 60,        4 * 60),       # 03:00–04:00
+    "event_london_open":       (10 * 60,       11 * 60),      # 10:00–11:00
+    "event_ny_open":           (15 * 60 + 30,  16 * 60 + 30), # 15:30–16:30
+    "event_overlap_asia_hk":   (3 * 60,        10 * 60),      # 03:00–10:00
+    "event_overlap_london_ny": (15 * 60 + 30,  19 * 60),      # 15:30–19:00
 }
 
 
@@ -66,12 +76,14 @@ def time_features_for_dt(value) -> dict:
     """
     _empty = {
         "session_asia": 0,
+        "session_hong_kong": 0,
         "session_london": 0,
         "session_new_york": 0,
         "event_tokyo_open": 0,
         "event_hk_open": 0,
         "event_london_open": 0,
         "event_ny_open": 0,
+        "event_overlap_asia_hk": 0,
         "event_overlap_london_ny": 0,
         "session_name": "OFF",
     }
@@ -125,12 +137,29 @@ class TimeManager:
         return self.now().hour
 
     def current_session(self) -> str:
-        """Определить текущую торговую сессию."""
-        hour = self.current_hour()
-        for session, times in SESSIONS.items():
-            if times["start"] <= hour < times["end"]:
-                return session
-        return "OFF"
+        """Определить текущую торговую сессию с учётом overlap."""
+        now = self.now()
+        total_minutes = now.hour * 60 + now.minute
+
+        asia = _SESSION_WINDOWS["session_asia"][0] <= total_minutes < _SESSION_WINDOWS["session_asia"][1]
+        hk   = _SESSION_WINDOWS["session_hong_kong"][0] <= total_minutes < _SESSION_WINDOWS["session_hong_kong"][1]
+        lon  = _SESSION_WINDOWS["session_london"][0] <= total_minutes < _SESSION_WINDOWS["session_london"][1]
+        ny   = _SESSION_WINDOWS["session_new_york"][0] <= total_minutes < _SESSION_WINDOWS["session_new_york"][1]
+
+        if asia and hk:
+            return "ASIA+HK"
+        elif asia:
+            return "ASIA"
+        elif lon and ny:
+            return "LONDON+NY"
+        elif lon:
+            return "LONDON"
+        elif ny:
+            return "NEW_YORK"
+        elif hk:
+            return "HONG_KONG"
+        else:
+            return "OFF"
 
     def session_direction(self, session: str = None) -> str:
         """Разрешённое направление для сессии."""

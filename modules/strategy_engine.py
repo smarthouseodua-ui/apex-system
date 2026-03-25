@@ -59,12 +59,10 @@ class StrategyEngine:
                 return await self._hourly_test_analyze(candidates)
 
             signals = []
-            session_hour = self._current_session_hour()
-            if session_hour is None:
-                logger.info("StrategyEngine: не в окне сессии — пропуск")
-                return []
+            now = datetime.now(PODGORICA)
+            session_hour = now.hour
 
-            logger.info(f"StrategyEngine: сессия {session_hour}:00 — сканирую {len(candidates)} кандидатов")
+            logger.info(f"StrategyEngine: hour={session_hour}:00 — сканирую {len(candidates)} кандидатов")
 
             for candidate in candidates:
                 signal = await self._session_orb_signal(candidate, session_hour)

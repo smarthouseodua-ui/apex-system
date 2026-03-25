@@ -162,6 +162,7 @@ class Orchestrator:
                     "session_name": position.get("session_name"),
                     "duration_minutes": duration_minutes,
                     "minutes_to_close": duration_minutes,
+                    "strategy_name": position.get("strategy_name") or self.config.get("active_filter"),
                 })
 
             logger.info(
@@ -185,18 +186,9 @@ class Orchestrator:
         await self.setup()
         await self._load_open_positions()
 
-        # Проверка: если уже после :40 — сессия не запускается (пропускается в test mode)
         now = datetime.now(PODGORICA)
         test_mode = self.config.get("_hourly_test", False)
-        if not test_mode and now.minute >= 40:
-            logger.info(
-                f"Session start blocked: current time {now.hour}:{now.minute:02d} — "
-                f"already past :40. Waiting for next hour."
-            )
-            return
-
-        session_end_str = f"{now.hour}:{40:02d}:00"
-        logger.info(f"Session window: {now.hour}:{now.minute:02d} → {session_end_str}")
+        logger.info(f"Pipeline 24/7 mode — start at {now.hour}:{now.minute:02d}")
 
         self.running = True
         self.state_manager.set_state("running")
@@ -235,13 +227,6 @@ class Orchestrator:
                         test_mode = False
                 except Exception:
                     pass
-
-                # Проверка окончания сессии (пропускается в test mode)
-                if not test_mode and datetime.now(PODGORICA).minute >= 40:
-                    logger.info("Session end reached (:40) — force-closing all positions")
-                    await self._close_all_session_end()
-                    self.running = False
-                    break
 
                 await self._run_cycle()
                 await asyncio.sleep(self.config.get("cycle_interval", 60))

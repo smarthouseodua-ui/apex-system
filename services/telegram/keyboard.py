@@ -4,32 +4,49 @@ from telegram import ReplyKeyboardMarkup, KeyboardButton
 def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("📊 Статус"),   KeyboardButton("⚡ ВАУ+"),     KeyboardButton("📍 Позиции")],
-            [KeyboardButton("➕ Депозит"),   KeyboardButton("➖ Снять")],
-            [KeyboardButton("♻️ Сброс"),    KeyboardButton("✅ Подтвердить")],
-            [KeyboardButton("🟢 Старт"),    KeyboardButton("🔴 Стоп")],
-            [KeyboardButton("▶️ NY 5M START"), KeyboardButton("🚀 5M СТАРТ")],
+            [KeyboardButton("📊 Статус"),    KeyboardButton("⚡ ВАУ+")],
+            [KeyboardButton("🟢 Старт"),     KeyboardButton("🔴 Стоп")],
+            [KeyboardButton("📍 Позиции"),    KeyboardButton("♻️ Сброс")],
+            [KeyboardButton("⚙️ Настройка бота")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True
     )
 
 
 def get_vau_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🎯 SL/TP"), KeyboardButton("⚡ Плечо"), KeyboardButton("📦 Позиция")],
-            [KeyboardButton("← Назад")],
+            [KeyboardButton("◀️ Назад")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True
     )
 
 
-def get_sltp_keyboard():
+def get_settings_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("🎯 SL"),  KeyboardButton("🎯 TP1")],
-            [KeyboardButton("🎯 TP2"), KeyboardButton("🎯 TP3")],
-            [KeyboardButton("← Назад")],
+            [KeyboardButton("🎯 Стоп-лосс")],
+            [KeyboardButton("🎯 ТП1"), KeyboardButton("🎯 ТП2"), KeyboardButton("🎯 ТП3")],
+            [KeyboardButton("⚡ Плечо")],
+            [KeyboardButton("➕ Позиция+"), KeyboardButton("➖ Позиция-")],
+            [KeyboardButton("◀️ Назад")],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True
+    )
+
+
+def get_reset_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("♻️ Сброс"), KeyboardButton("◀️ Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True
     )

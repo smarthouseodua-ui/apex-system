@@ -68,6 +68,12 @@ class Finalizer:
             except Exception:
                 pass
 
+        try:
+            from services.test_control import read as tc_read
+            strategy_name = tc_read().get("active_filter")
+        except Exception:
+            strategy_name = None
+
         return {
             **position,
             "close_price": close_price,
@@ -79,6 +85,7 @@ class Finalizer:
             "session_name": position.get("session_name"),
             "duration_minutes": duration_minutes,
             "minutes_to_close": duration_minutes,
+            "strategy_name": strategy_name,
         }
 
     async def _save(self, result: dict) -> None:
