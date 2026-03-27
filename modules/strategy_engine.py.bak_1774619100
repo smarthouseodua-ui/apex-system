@@ -1,0 +1,854 @@
+"""
+APEX PROTOCOL™ — Strategy Engine
+
+Единая стратегия SESSION_ORB_5M для всех сессий (ASIA / HONG_KONG / LONDON / NEW_YORK).
+Сессия = контекст (время старта, имя). Стратегия = одна.
+
+ORB = первая 5m свеча от точного времени открытия сессии.
+Диапазон фиксируется один раз (locked), breakout работает от него до конца сессии.
+Сброс — при смене даты или сессии.
+
+Тестовые режимы (FIRST_5M_SESSION, hourly_test) сохранены для обратной совместимости.
+Пишет в SKL01_T02_strategy_log.
+"""
+
+import logging
+from datetime import datetime
+from pytz import timezone as tz
+from core.event_bus import EventBus
+from core.time_manager import _SESSION_WINDOWS, _SESSION_LABELS
+
+PODGORICA = tz("Europe/Podgorica")
+from services.exchange_service import ExchangeService
+from storage.db.repository import Repository
+
+logger = logging.getLogger("apex.strategy_engine")
+
+# Маппинг имени сессии → ключ в _SESSION_WINDOWS
+_LABEL_TO_KEY = {v: k for k, v in _SESSION_LABELS.items()}
+
+
+class StrategyEngine:
+
+    def __init__(self, config: dict, event_bus: EventBus):
+        self.config = config
+        self.event_bus = event_bus
+        self.exchange_service = ExchangeService(config)
+        self.repo = Repository()
+        self._connected = False
+        # hourly test: {target_hour: set(symbols already traded)}
+        self._hourly_trades: dict[int, set] = {}
+        # ORB state: (session_name, symbol) → {high, low, session_id}
+        self._orb_state: dict[tuple[str, str], dict] = {}
+
+    async def _ensure_connected(self):
+        if not self._connected:
+            await self.exchange_service.connect()
+            self._connected = True
+
+    def _get_active_sessions(self) -> list[tuple[str, int]]:
+        """Возвращает список активных сессий: [(label, start_minutes), ...]"""
+        now = datetime.now(PODGORICA)
+        total_minutes = now.hour * 60 + now.minute
+        active = []
+        for key, (start, end) in _SESSION_WINDOWS.items():
+            if start <= total_minutes < end:
+                active.append((_SESSION_LABELS[key], start))
+        return active
+
+    def _session_open_minutes(self, session_name: str) -> int | None:
+        """Время открытия сессии в минутах от полуночи (Podgorica) из time_manager."""
+        key = _LABEL_TO_KEY.get(session_name)
+        if not key:
+            return None
+        return _SESSION_WINDOWS[key][0]
+
+    async def analyze(self, candidates: list) -> list:
+        """Главная точка входа. Единая стратегия для всех сессий."""
+        try:
+            await self._ensure_connected()
+
+            # --- Тестовые режимы (обратная совместимость) ---
+            try:
+                from services.test_control import read as tc_read
+                tc = tc_read()
+            except Exception:
+                tc = {}
+
+            if tc.get("mode") == "FIRST_5M_SESSION":
+                return await self.run_first_5m_session(candidates)
+
+            if self.config.get("_hourly_test"):
+                return await self._hourly_test_analyze(candidates)
+
+            # --- Unified SESSION_ORB_5M: одна стратегия для всех сессий ---
+            now = datetime.now(PODGORICA)
+            active_sessions = self._get_active_sessions()
+            # Берём последнюю активную сессию (самую недавно начавшуюся)
+            session_name = active_sessions[-1][0] if active_sessions else "OFF"
+            session_hour = now.hour
+
+            logger.info(
+                f"StrategyEngine [{session_name}]: hour={session_hour}:00 — "
+                f"scanning {len(candidates)} candidates"
+            )
+
+            signals = []
+            for candidate in candidates:
+                signal = await self._session_orb_signal(candidate, session_hour, session_name)
+                if signal:
+                    self.repo.log_strategy(signal)
+                    signals.append(signal)
+
+            logger.info(f"StrategyEngine [{session_name}]: {len(signals)} signals")
+            await self.event_bus.publish("strategy.done", {"signals": signals})
+            return signals
+        except Exception as e:
+            logger.error(f"StrategyEngine error: {e}", exc_info=True)
+            return []
+
+    # ── FIRST_5M_SESSION (тестовый режим) ──────────────────────────────────────
+
+    async def run_first_5m_session(self, candidates: list) -> list:
+        """
+        FIRST_5M_SESSION — тестовый режим, не зависит от hourly_test.
+
+        1. Читает start_time и fired из test_control
+        2. Если fired == True → return []
+        3. Для каждого кандидата берёт 10 свечей 5m
+        4. Находит первую свечу, close_time которой > start_time
+        5. Если свеча ещё не закрыта → пропуск
+        6. LONG:  first_close > prev_high
+           SHORT: first_close < prev_low
+        7. После первого сигнала → tc_write(first_5m_fired=True), выход
+        """
+        try:
+            from services.test_control import read as tc_read, write as tc_write
+            tc = tc_read()
+        except Exception:
+            logger.error("FIRST_5M_SESSION: не удалось прочитать test_control")
+            return []
+
+        # Уже сработала — пропуск
+        if tc.get("first_5m_fired"):
+            logger.info("FIRST_5M_SESSION: уже сработала (fired=True) — пропуск")
+            return []
+
+        # Парсим start_time
+        start_time_str = tc.get("first_5m_session_start")
+        if not start_time_str:
+            logger.warning("FIRST_5M_SESSION: нет first_5m_session_start — пропуск")
+            return []
+
+        try:
+            start_time = datetime.strptime(start_time_str, "%Y-%m-%dT%H:%M:%S")
+        except (ValueError, TypeError):
+            logger.error(f"FIRST_5M_SESSION: неверный формат start_time: {start_time_str}")
+            return []
+
+        # start_time в миллисекундах для сравнения с candle timestamp
+        start_ts_ms = int(start_time.timestamp() * 1000)
+
+        now = datetime.now(PODGORICA)
+        now_ts_ms = int(now.timestamp() * 1000)
+
+        logger.info(
+            f"FIRST_5M_SESSION: start={start_time_str}, "
+            f"кандидатов={len(candidates)}, ожидаю закрытия первой 5m свечи"
+        )
+
+        signals = []
+
+        for candidate in candidates:
+            symbol = candidate["symbol"]
+            try:
+                candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=10)
+                if len(candles) < 2:
+                    continue
+
+                first_candle = None
+                prev_candle = None
+
+                for i, candle in enumerate(candles):
+                    candle_open_ts = candle[0]
+                    candle_close_ts = candle_open_ts + 5 * 60 * 1000  # +5 минут
+
+                    if candle_close_ts > start_ts_ms:
+                        if candle_close_ts > now_ts_ms:
+                            break
+
+                        first_candle = candle
+                        if i > 0:
+                            prev_candle = candles[i - 1]
+                        break
+
+                if first_candle is None or prev_candle is None:
+                    continue
+
+                first_close = first_candle[4]
+                prev_high   = prev_candle[2]
+                prev_low    = prev_candle[3]
+
+                if prev_high <= prev_low:
+                    continue
+
+                current_price = candidate["price"]
+
+                if first_close > prev_high:
+                    direction = "long"
+                elif first_close < prev_low:
+                    direction = "short"
+                else:
+                    continue
+
+                signal = {
+                    "symbol":       symbol,
+                    "direction":    direction,
+                    "entry":        round(current_price, 6),
+                    "strategy":     "FIRST_5M_SESSION",
+                    "timeframe":    "5m",
+                    "session_hour": now.hour,
+                    "first_close":  first_close,
+                    "prev_high":    prev_high,
+                    "prev_low":     prev_low,
+                    "confidence":   1.0,
+                    "generated_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "score":            candidate.get("score"),
+                    "ema":              candidate.get("ema"),
+                    "price":            candidate.get("price"),
+                    "reasons":          candidate.get("reasons", []),
+                    "candidate_status": candidate.get("candidate_status"),
+                    "scanned_at":       candidate.get("scanned_at"),
+                }
+
+                self.repo.log_strategy(signal)
+                signals.append(signal)
+
+                try:
+                    tc_write({"first_5m_fired": True})
+                except Exception:
+                    pass
+
+                logger.info(
+                    f"FIRST_5M_SESSION: сигнал {direction} {symbol} "
+                    f"(first_close={first_close}, prev_high={prev_high}, prev_low={prev_low})"
+                )
+                break
+
+            except Exception as e:
+                logger.error(f"FIRST_5M_SESSION error {symbol}: {e}")
+                continue
+
+        if not signals:
+            logger.info("FIRST_5M_SESSION: нет сигналов в этом цикле")
+
+        await self.event_bus.publish("strategy.done", {"signals": signals})
+        return signals
+
+    # ── HOURLY TEST (тестовый режим) ───────────────────────────────────────────
+
+    async def _hourly_test_analyze(self, candidates: list) -> list:
+        """
+        Часовой тест: SESSION_ORB_5M, FIRST_10M_BREAKOUT, PREV_CANDLE_BREAKOUT.
+        Один вход на символ в час. Только simulation.
+        """
+        now = datetime.now(PODGORICA)
+
+        try:
+            from services.test_control import read as tc_read, write as tc_write
+            tc = tc_read()
+        except Exception:
+            tc = {}
+
+        active_filter = tc.get("active_filter", "SESSION_ORB_5M")
+        manual_mode   = tc.get("manual_hour_enabled", False)
+        selected_hour = tc.get("selected_hour")
+
+        if manual_mode and selected_hour is not None:
+            target_hour = selected_hour
+            logger.info(
+                f"HourlyTest MANUAL: целевой час={target_hour}:00, "
+                f"текущее время={now.hour}:{now.minute:02d}"
+            )
+        else:
+            target_hour = now.hour
+
+            if active_filter == "PREV_CANDLE_BREAKOUT":
+                pass
+            elif active_filter == "FIRST_10M_BREAKOUT":
+                if now.minute < 10 or now.minute >= 15:
+                    logger.info(
+                        f"HourlyTest FIRST_10M_BREAKOUT: вне окна входа "
+                        f"(минута={now.minute}, нужно 10–14) — пропуск"
+                    )
+                    return []
+            else:
+                if now.minute >= 5:
+                    logger.info(f"HourlyTest AUTO: вне окна (минута={now.minute}) — пропуск")
+                    return []
+
+        if target_hour not in self._hourly_trades:
+            self._hourly_trades = {target_hour: set()}
+
+        already_traded = self._hourly_trades[target_hour]
+        signals = []
+
+        logger.info(
+            f"HourlyTest [{active_filter}]: час={target_hour}:00 — "
+            f"сканирую {len(candidates)} кандидатов, "
+            f"уже торговано: {len(already_traded)}"
+        )
+
+        for candidate in candidates:
+            symbol = candidate["symbol"]
+            if active_filter != "PREV_CANDLE_BREAKOUT" and symbol in already_traded:
+                continue
+
+            if active_filter == "PREV_CANDLE_BREAKOUT":
+                signal = await self._prev_candle_breakout_signal(candidate, target_hour)
+            elif active_filter == "FIRST_10M_BREAKOUT":
+                signal = await self._first_10m_breakout_signal(candidate, target_hour)
+                if signal:
+                    signal["strategy"] = "FIRST_10M_BREAKOUT"
+            elif manual_mode:
+                signal = await self._manual_open_signal(candidate, target_hour)
+            else:
+                signal = await self._session_orb_signal(candidate, target_hour)
+                if signal:
+                    signal["strategy"] = "HOURLY_ORB_5M"
+
+            if signal:
+                if active_filter != "PREV_CANDLE_BREAKOUT":
+                    already_traded.add(symbol)
+                self.repo.log_strategy(signal)
+                signals.append(signal)
+
+        logger.info(f"HourlyTest [{active_filter}]: час={target_hour}:00 → {len(signals)} сигналов")
+
+        if signals and manual_mode:
+            try:
+                first = signals[0]
+                tc_write({
+                    "selected_hour_orb_high": first.get("orb_high"),
+                    "selected_hour_orb_low":  first.get("orb_low"),
+                })
+            except Exception:
+                pass
+
+        await self.event_bus.publish("strategy.done", {"signals": signals})
+        return signals
+
+    # ── SIGNAL METHODS (единые для всех сессий) ───────────────────────────────
+
+    async def _session_orb_signal(
+        self, candidate: dict, session_hour: int, session_name: str = ""
+    ) -> dict | None:
+        """
+        SESSION_ORB_5M — единая стратегия Opening Range Breakout.
+        Работает одинаково для ASIA, HONG_KONG, LONDON, NEW_YORK.
+
+        Логика:
+        1. Определить время открытия сессии из time_manager
+        2. Найти первую 5m свечу сессии (session_open → session_open + 5 мин)
+        3. Дождаться закрытия свечи
+        4. Зафиксировать orb_high / orb_low (locked)
+        5. Breakout: price > orb_high → LONG, price < orb_low → SHORT
+        6. Диапазон НЕ пересчитывается до конца сессии
+        7. Сброс при смене даты или сессии
+        """
+        symbol = candidate["symbol"]
+        now = datetime.now(PODGORICA)
+        session_id = f"{now.strftime('%Y-%m-%d')}_{session_name}"
+        state_key = (session_name, symbol)
+
+        # ── Проверка / сброс состояния ──
+        state = self._orb_state.get(state_key)
+        if state and state["session_id"] != session_id:
+            del self._orb_state[state_key]
+            state = None
+
+        # ── Фиксация ORB (один раз за сессию на символ) ──
+        if not state:
+            open_minutes = self._session_open_minutes(session_name)
+            if open_minutes is None:
+                return None
+
+            # Точное время открытия сессии сегодня (Europe/Podgorica)
+            open_dt = now.replace(
+                hour=open_minutes // 60,
+                minute=open_minutes % 60,
+                second=0, microsecond=0,
+            )
+            open_ts_ms = int(open_dt.timestamp() * 1000)
+            candle_close_ts_ms = open_ts_ms + 5 * 60 * 1000  # закрытие первой 5m свечи
+            now_ts_ms = int(now.timestamp() * 1000)
+
+            # Первая свеча ещё не закрылась — ждём
+            if now_ts_ms < candle_close_ts_ms:
+                return None
+
+            # Загружаем свечи с запасом, чтобы найти нужную
+            minutes_elapsed = (now_ts_ms - open_ts_ms) / (60 * 1000)
+            limit = min(int(minutes_elapsed / 5) + 5, 100)
+            limit = max(limit, 5)
+
+            try:
+                candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=limit)
+            except Exception as e:
+                logger.error(f"ORB fetch error {symbol}: {e}")
+                return None
+
+            if not candles:
+                return None
+
+            # Ищем свечу, открытую в момент старта сессии (±60 сек допуск)
+            session_candle = None
+            for c in candles:
+                if abs(c[0] - open_ts_ms) < 60_000:
+                    session_candle = c
+                    break
+
+            if session_candle is None:
+                logger.warning(
+                    f"ORB: свеча сессии {session_name} не найдена для {symbol} "
+                    f"(open_ts={open_ts_ms}, candles[0..{len(candles)-1}])"
+                )
+                return None
+
+            orb_high = session_candle[2]
+            orb_low = session_candle[3]
+
+            if orb_high <= orb_low:
+                return None
+
+            # Фиксируем
+            self._orb_state[state_key] = {
+                "high": orb_high,
+                "low": orb_low,
+                "mid": round((orb_high + orb_low) / 2, 6),
+                "size": round(orb_high - orb_low, 6),
+                "session_id": session_id,
+                "_orb_candle_ts": session_candle[0],
+            }
+            state = self._orb_state[state_key]
+
+            logger.info(
+                f"ORB LOCKED [{session_name}] {symbol}: "
+                f"high={orb_high}, low={orb_low}, mid={state['mid']}, size={state['size']}, "
+                f"candle_open={datetime.utcfromtimestamp(session_candle[0] / 1000).strftime('%H:%M')} UTC"
+            )
+
+        orb_high = state["high"]
+        orb_low  = state["low"]
+
+        # ── STEPS 1-3: Retrospective scan + live incremental ──
+        if not state.get("entry_confirmed"):
+            await self._orb_scan_steps(symbol, session_name, state, orb_high, orb_low)
+            if not state.get("entry_confirmed"):
+                return None
+
+        # ── STEP 4: Signal generation (R-based SL/TP) ──
+        direction  = state["breakout_direction"]
+        entry      = state["entry_price"]
+
+        # SL от retest candle extreme
+        if direction == "long":
+            stop_loss = round(state["retest_candle_low"], 6)
+        else:
+            stop_loss = round(state["retest_candle_high"], 6)
+
+        # R = расстояние entry → SL
+        risk_r = abs(entry - stop_loss)
+        if risk_r == 0:
+            logger.warning(f"ORB SKIP [{session_name}] {symbol}: R=0 (entry={entry}, sl={stop_loss})")
+            return None
+
+        # TP на основе R-мультипликатора
+        if direction == "long":
+            tp1 = round(entry + 1 * risk_r, 6)
+            tp2 = round(entry + 2 * risk_r, 6)
+            tp3 = round(entry + 3 * risk_r, 6)
+        else:
+            tp1 = round(entry - 1 * risk_r, 6)
+            tp2 = round(entry - 2 * risk_r, 6)
+            tp3 = round(entry - 3 * risk_r, 6)
+
+        logger.info(
+            f"ORB SIGNAL [{session_name}] {symbol}: {direction.upper()} "
+            f"entry={entry}, sl={stop_loss}, R={round(risk_r, 6)}, "
+            f"tp1={tp1}, tp2={tp2}, tp3={tp3}"
+        )
+
+        return {
+            "symbol":             symbol,
+            "direction":          direction,
+            "entry":              entry,
+            "sl":                 stop_loss,
+            "tp1":                tp1,
+            "tp2":                tp2,
+            "tp3":                tp3,
+            "risk_R_value":       round(risk_r, 6),
+            "strategy":           "SESSION_ORB_5M",
+            "timeframe":          "5m",
+            "session_hour":       session_hour,
+            "session_name":       session_name,
+            "orb_high":           orb_high,
+            "orb_low":            orb_low,
+            "orb_mid":            state["mid"],
+            "orb_size":           state["size"],
+            "retest_price":       state.get("retest_price"),
+            "retest_confirmed":   True,
+            "confirmation_type":  state.get("confirmation_type"),
+            "confidence":         1.0,
+            "generated_at":       datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S"),
+            "score":              candidate.get("score"),
+            "ema":                candidate.get("ema"),
+            "price":              candidate.get("price"),
+            "reasons":            candidate.get("reasons", []),
+            "candidate_status":   candidate.get("candidate_status"),
+            "scanned_at":         candidate.get("scanned_at"),
+        }
+
+    async def _orb_scan_steps(
+        self, symbol: str, session_name: str, state: dict,
+        orb_high: float, orb_low: float,
+    ) -> None:
+        """
+        Unified state machine: breakout → retest → confirmation.
+        Retrospective on first call (scans all 5m candles after ORB chronologically),
+        then switches to 1m confirmation scan. Mutates state in place.
+        """
+        direction = state.get("breakout_direction")
+
+        # ── Load 5m candles (from ORB to now) ──
+        candles_5m = None
+        if not state.get("retest_confirmed"):
+            try:
+                now = datetime.now(PODGORICA)
+                open_minutes = self._session_open_minutes(session_name)
+                if open_minutes is None:
+                    return
+                minutes_since_open = (now.hour * 60 + now.minute) - open_minutes
+                limit = max(int(minutes_since_open / 5) + 3, 10)
+                candles_5m = await self.exchange_service.get_ohlcv(symbol, "5m", limit=limit)
+            except Exception as e:
+                logger.error(f"ORB scan fetch error {symbol}: {e}")
+                return
+
+            if not candles_5m or len(candles_5m) < 3:
+                return
+
+        # ── STEP 1: Breakout scan (5m, chronological after ORB candle) ──
+        if candles_5m and not direction:
+            orb_ts = state.get("_orb_candle_ts")
+            orb_idx = None
+            for i, c in enumerate(candles_5m):
+                if orb_ts and abs(c[0] - orb_ts) < 60_000:
+                    orb_idx = i
+                    break
+                if c[2] == orb_high and c[3] == orb_low:
+                    orb_idx = i
+                    break
+
+            if orb_idx is None:
+                return
+
+            for c in candles_5m[orb_idx + 1:]:
+                if c == candles_5m[-1]:
+                    continue  # skip unclosed
+                cc = c[4]
+                if cc > orb_high:
+                    direction = "long"
+                    state["breakout_direction"] = "long"
+                    state["breakout_candle_close"] = cc
+                    state["breakout_candle_ts"] = c[0]
+                    logger.info(
+                        f"ORB BREAKOUT [{session_name}] {symbol}: LONG "
+                        f"close={cc} > orb_high={orb_high}"
+                    )
+                    break
+                elif cc < orb_low:
+                    direction = "short"
+                    state["breakout_direction"] = "short"
+                    state["breakout_candle_close"] = cc
+                    state["breakout_candle_ts"] = c[0]
+                    logger.info(
+                        f"ORB BREAKOUT [{session_name}] {symbol}: SHORT "
+                        f"close={cc} < orb_low={orb_low}"
+                    )
+                    break
+
+            if not direction:
+                return
+
+        # ── STEP 2: Retest scan (5m, chronological after breakout candle) ──
+        if candles_5m and not state.get("retest_confirmed"):
+            breakout_ts = state.get("breakout_candle_ts", 0)
+
+            for c in candles_5m:
+                if c[0] <= breakout_ts:
+                    continue
+                if c == candles_5m[-1]:
+                    continue  # skip unclosed
+
+                c_high, c_low, c_close = c[2], c[3], c[4]
+
+                # INVALIDATION: close вернулся внутрь ORB
+                if orb_low < c_close < orb_high:
+                    logger.info(
+                        f"ORB INVALIDATED [{session_name}] {symbol}: "
+                        f"close={c_close} inside ORB [{orb_low}–{orb_high}] — reset"
+                    )
+                    state.pop("breakout_direction", None)
+                    state.pop("breakout_candle_close", None)
+                    state.pop("breakout_candle_ts", None)
+                    return
+
+                if direction == "long":
+                    if c_low <= orb_high and c_close >= orb_high:
+                        state["retest_confirmed"] = True
+                        state["retest_candle_low"] = c_low
+                        state["retest_candle_high"] = c_high
+                        state["retest_price"] = round(c_low, 6)
+                        state["retest_candle_ts"] = c[0]
+                        logger.info(
+                            f"ORB RETEST [{session_name}] {symbol}: LONG "
+                            f"low={c_low} <= {orb_high}, close={c_close}"
+                        )
+                        break
+                else:
+                    if c_high >= orb_low and c_close <= orb_low:
+                        state["retest_confirmed"] = True
+                        state["retest_candle_low"] = c_low
+                        state["retest_candle_high"] = c_high
+                        state["retest_price"] = round(c_high, 6)
+                        state["retest_candle_ts"] = c[0]
+                        logger.info(
+                            f"ORB RETEST [{session_name}] {symbol}: SHORT "
+                            f"high={c_high} >= {orb_low}, close={c_close}"
+                        )
+                        break
+
+            if not state.get("retest_confirmed"):
+                return
+
+        # ── STEP 3: Confirmation scan (1m, chronological after retest) ──
+        if not state.get("entry_confirmed"):
+            try:
+                retest_ts = state.get("retest_candle_ts", 0)
+                now_ts = int(datetime.now(PODGORICA).timestamp() * 1000)
+                minutes_since_retest = max(int((now_ts - retest_ts) / 60_000) + 3, 10) if retest_ts else 30
+                candles_1m = await self.exchange_service.get_ohlcv(
+                    symbol, "1m", limit=minutes_since_retest
+                )
+            except Exception as e:
+                logger.error(f"ORB confirmation fetch error {symbol}: {e}")
+                return
+
+            if not candles_1m or len(candles_1m) < 3:
+                return
+
+            # Find 1m candles starting after retest 5m candle close
+            retest_end_ts = (state.get("retest_candle_ts", 0)) + 5 * 60 * 1000
+            start_idx = 0
+            for i, c in enumerate(candles_1m):
+                if c[0] >= retest_end_ts:
+                    start_idx = i
+                    break
+
+            direction = state["breakout_direction"]
+            for i in range(max(start_idx, 1), len(candles_1m) - 1):
+                prev = candles_1m[i - 1]
+                curr = candles_1m[i]
+
+                p_open, p_high, p_low = prev[1], prev[2], prev[3]
+                c_open, c_close = curr[1], curr[4]
+
+                confirmation_type = None
+                if direction == "long":
+                    if c_close > c_open and c_close > p_high and c_open < p_open:
+                        confirmation_type = "ENGULFING"
+                    elif c_close > p_high:
+                        confirmation_type = "CLOSE_BREAK"
+                else:
+                    if c_close < c_open and c_close < p_low and c_open > p_open:
+                        confirmation_type = "ENGULFING"
+                    elif c_close < p_low:
+                        confirmation_type = "CLOSE_BREAK"
+
+                if confirmation_type:
+                    state["entry_confirmed"] = True
+                    state["confirmation_type"] = confirmation_type
+                    state["entry_price"] = round(c_close, 6)
+                    logger.info(
+                        f"ORB CONFIRMED [{session_name}] {symbol}: {direction.upper()} "
+                        f"type={confirmation_type}, entry={c_close}"
+                    )
+                    return
+
+    async def _prev_candle_breakout_signal(self, candidate: dict, session_hour: int) -> dict | None:
+        """
+        PREV CANDLE BREAKOUT (тестовый режим непрерывной генерации):
+        - Берёт последнюю закрытую 5m свечу (candles[1] из limit=3)
+        - Если current_price > prev_high → LONG
+        - Если current_price < prev_low  → SHORT
+        """
+        symbol = candidate["symbol"]
+        try:
+            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=3)
+            if len(candles) < 2:
+                return None
+
+            prev_candle = candles[1]
+            prev_high = prev_candle[2]
+            prev_low  = prev_candle[3]
+
+            if prev_high <= prev_low:
+                return None
+
+            current_price = candidate["price"]
+
+            if current_price > prev_high:
+                direction = "long"
+                entry = round(current_price, 6)
+                sl    = round(entry * (1 - 0.004), 6)
+            elif current_price < prev_low:
+                direction = "short"
+                entry = round(current_price, 6)
+                sl    = round(entry * (1 + 0.004), 6)
+            else:
+                return None
+
+            return {
+                "symbol":       symbol,
+                "direction":    direction,
+                "entry":        entry,
+                "sl":           sl,
+                "strategy":     "PREV_CANDLE_BREAKOUT",
+                "timeframe":    "5m",
+                "session_hour": session_hour,
+                "orb_high":     prev_high,
+                "orb_low":      prev_low,
+                "confidence":   1.0,
+                "generated_at": datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S"),
+                "score":            candidate.get("score"),
+                "ema":              candidate.get("ema"),
+                "price":            candidate.get("price"),
+                "reasons":          candidate.get("reasons", []),
+                "candidate_status": candidate.get("candidate_status"),
+                "scanned_at":       candidate.get("scanned_at"),
+            }
+        except Exception as e:
+            logger.error(f"PREV_CANDLE_BREAKOUT error {symbol}: {e}")
+            return None
+
+    async def _first_10m_breakout_signal(self, candidate: dict, session_hour: int) -> dict | None:
+        """
+        FIRST 10M BREAKOUT:
+        - Берёт первые 2 свечи 5m текущего часа (= 10 минут)
+        - first_high = max HIGH двух свечей
+        - first_low  = min LOW  двух свечей
+        - Если current_price > first_high → LONG
+        - Если current_price < first_low  → SHORT
+        """
+        symbol = candidate["symbol"]
+        try:
+            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=3)
+            if len(candles) < 2:
+                return None
+
+            c0, c1 = candles[0], candles[1]
+            first_high = max(c0[2], c1[2])
+            first_low  = min(c0[3], c1[3])
+
+            if first_high <= first_low:
+                return None
+
+            current_price = candidate["price"]
+
+            if current_price > first_high:
+                direction = "long"
+                entry = round(current_price, 6)
+                sl    = round(entry * (1 - 0.004), 6)
+            elif current_price < first_low:
+                direction = "short"
+                entry = round(current_price, 6)
+                sl    = round(entry * (1 + 0.004), 6)
+            else:
+                return None
+
+            return {
+                "symbol":       symbol,
+                "direction":    direction,
+                "entry":        entry,
+                "sl":           sl,
+                "strategy":     "FIRST_10M_BREAKOUT",
+                "timeframe":    "5m",
+                "session_hour": session_hour,
+                "orb_high":     first_high,
+                "orb_low":      first_low,
+                "confidence":   1.0,
+                "generated_at": datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S"),
+                "score":            candidate.get("score"),
+                "ema":              candidate.get("ema"),
+                "price":            candidate.get("price"),
+                "reasons":          candidate.get("reasons", []),
+                "candidate_status": candidate.get("candidate_status"),
+                "scanned_at":       candidate.get("scanned_at"),
+            }
+        except Exception as e:
+            logger.error(f"FIRST_10M_BREAKOUT error {symbol}: {e}")
+            return None
+
+    async def _manual_open_signal(self, candidate: dict, session_hour: int) -> dict | None:
+        """
+        Ручной тест: сравниваем текущую цену с open первой 5м-свечи.
+        LONG  если current_price > open * 1.001
+        SHORT если current_price < open * 0.999
+        """
+        symbol = candidate["symbol"]
+        try:
+            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=2)
+            if len(candles) < 1:
+                return None
+
+            ref_candle = candles[0]
+            open_price = ref_candle[1]
+            orb_high   = ref_candle[2]
+            orb_low    = ref_candle[3]
+            current_price = candidate["price"]
+
+            if current_price > open_price * 1.001:
+                direction = "long"
+                entry = round(current_price, 6)
+                sl    = round(orb_low, 6)
+            elif current_price < open_price * 0.999:
+                direction = "short"
+                entry = round(current_price, 6)
+                sl    = round(orb_high, 6)
+            else:
+                return None
+
+            return {
+                "symbol":       symbol,
+                "direction":    direction,
+                "entry":        entry,
+                "sl":           sl,
+                "strategy":     "MANUAL_OPEN_5M",
+                "timeframe":    "5m",
+                "session_hour": session_hour,
+                "orb_high":     orb_high,
+                "orb_low":      orb_low,
+                "open_price":   open_price,
+                "confidence":   1.0,
+                "generated_at": datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S"),
+                "score":            candidate.get("score"),
+                "ema":              candidate.get("ema"),
+                "price":            candidate.get("price"),
+                "reasons":          candidate.get("reasons", []),
+                "candidate_status": candidate.get("candidate_status"),
+                "scanned_at":       candidate.get("scanned_at"),
+            }
+        except Exception as e:
+            logger.error(f"ManualOpenSignal error {symbol}: {e}")
+            return None

@@ -102,46 +102,38 @@ def safe_format_dt(value: Any) -> str:
 
 def get_session_info() -> dict:
     try:
-        import yaml
-        from core.time_manager import TimeManager, SESSIONS
+        from core.session_engine import get_active_session, get_all_sessions
 
-        with open(SYSTEM_YAML_PATH, "r", encoding="utf-8") as f:
-            config = yaml.safe_load(f)
-
-        tm = TimeManager(config)
-        info = tm.get_session_info()
-        session = info["session"]
-        hour = info["hour"]
-
-        session_times = SESSIONS.get(session, {})
-        end_hour = session_times.get("end", hour)
-        minutes_left = (end_hour - hour) * 60 - tm.now().minute
-
-        if session == "OFF":
-            status = "не активна"
-            time_left = "—"
-        elif minutes_left <= 0:
-            status = "завершена"
-            time_left = "0 мин"
-        else:
-            status = "активна"
-            h, m = divmod(minutes_left, 60)
-            time_left = f"{h} ч {m} мин" if h else f"{m} мин"
+        active = get_active_session()
+        if not active:
+            return {
+                "session":    "—",
+                "фаза":       "ОЖИДАНИЕ",
+                "status":     "не активна",
+                "time_left":  "—",
+                "подсказка":  "Все сессии закрыты",
+                "is_trading": False,
+                "сигнал_разрешён": False,
+            }
 
         return {
-            "session":    SESSION_RU.get(session, session),
-            "direction":  DIRECTION_RU.get(info["direction"], info["direction"]),
-            "status":     status,
-            "time_left":  time_left,
-            "is_trading": info["is_trading"],
+            "session":    active["сессия"],
+            "фаза":       active["фаза"],
+            "status":     active["фаза"],
+            "time_left":  active.get("до_закрытия_мин", active.get("до_конца_входа_мин", active.get("до_60_мин", "—"))),
+            "подсказка":  active["подсказка"],
+            "is_trading": active["фаза"] not in ("ОЖИДАНИЕ", "СЕССИЯ ЗАКРЫТА"),
+            "сигнал_разрешён": active["сигнал_разрешён"],
         }
     except Exception:
         return {
             "session":    "—",
-            "direction":  "—",
+            "фаза":       "—",
             "status":     "—",
             "time_left":  "—",
+            "подсказка":  "—",
             "is_trading": False,
+            "сигнал_разрешён": False,
         }
 
 
@@ -361,6 +353,59 @@ def do_reset_data_core() -> dict:
 
 
 # ── Entry points ──────────────────────────────────────────────────────────────
+
+async def turn_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+    try:
+        from services.test_control import read as tc_read, write as tc_write
+        tc_write({"trading_enabled": True})
+        await update.message.reply_text("🟢 Trading ENABLED")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
+
+async def turn_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+    try:
+        from services.test_control import read as tc_read, write as tc_write
+        tc_write({"trading_enabled": False})
+        await update.message.reply_text("🔴 Trading DISABLED")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ Доступ запрещён")
+        return
+
+    try:
+        from storage.db.repository import Repository
+        from services.test_control import read as tc_read
+
+        repo = Repository()
+        tc = tc_read()
+        open_positions = repo.get_open_positions()
+        session_trades = repo.get_session_trade_count()
+        trading_enabled = tc.get("trading_enabled", False)
+        mode = tc.get("mode", "OFF")
+
+        msg = (
+            f"⚡ <b>APEX STATUS</b>\n\n"
+            f"Trading: <b>{'LIVE' if trading_enabled else 'DISABLED'}</b>\n"
+            f"Mode: <b>{mode}</b>\n"
+            f"Open positions: <b>{len(open_positions)}</b>\n"
+            f"Trades today: <b>{session_trades}</b>\n"
+        )
+    except Exception as e:
+        msg = f"⚠️ Status error: {e}"
+
+    await update.message.reply_text(msg, parse_mode="HTML")
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_user or not is_allowed(update.effective_user.id):
@@ -889,8 +934,9 @@ async def _handle_text_inner(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "⚡ <b>ВАУ+</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"<code>🕐 Сессия      </code> <b>{info['session']}</b>\n"
-            f"<code>📌 Состояние   </code> <b>{info['status']}</b>\n"
-            f"<code>⏳ До конца    </code> <b>{info['time_left']}</b>\n"
+            f"<code>📌 Фаза        </code> <b>{info['фаза']}</b>\n"
+            f"<code>🎯 Сигнал      </code> <b>{'СИГНАЛ РАЗРЕШЁН' if info.get('сигнал_разрешён') else 'СИГНАЛ ЗАПРЕЩЁН'}</b>\n"
+            f"<code>💡 Подсказка   </code> <i>{info.get('подсказка', '—')}</i>\n"
             "\n"
             f"<code>⚙️ Режим       </code> <b>{mode_label}</b>\n"
             f"<code>📄 Стратегия   </code> <b>{active_filter}</b>\n"

@@ -17,12 +17,12 @@ risk:
   tp3_pct: 0.4      # TP3 = +0.4%
 
   # Прочие параметры
-  max_trade_minutes:  20
+  max_trade_minutes:  90
   max_daily_loss_pct: 5.0
   max_drawdown_pct:   15.0
   leverage:           1
   rr_ratio:           2.0
-  max_positions:      5
+  max_positions:      50
 
   # TP распределение (% от позиции)
   tp1_close_pct: 50

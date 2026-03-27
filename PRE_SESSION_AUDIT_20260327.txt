@@ -1,0 +1,31 @@
+PRE_SESSION AUDIT — 2026-03-27
+
+1. PRE_SESSION trigger works.
+2. Session detection works for NEW_YORK.
+3. Root cause fixed:
+   orchestrator now calls await self.scanner._ensure_connected()
+   before await self.pre_session.analyze(session)
+4. Exchange connection now succeeds.
+5. PRE_SESSION analysis runs and writes to SKL01_T09_pre_session_log.
+6. Verified rows in T09: present.
+7. Verified fields actively populated:
+   - symbol
+   - session_name
+   - market_structure_state
+   - bos_detected
+   - choch_detected
+   - order_block_present
+   - fvg_present
+   - displacement_present
+   - sweep_present
+   - created_at
+8. Verified hardcoded placeholders in pre_session_smc.py:
+   - liquidity_pool_present = 0
+   - mitigation_present = 0
+9. Verified _build_comment includes:
+   zone, trend, BOS, CHoCH, OB, FVG, SWEEP
+10. Verified _build_comment does NOT include:
+   liquidity pool, mitigation, displacement
+
+Current status:
+PRE_SESSION SMC is operational, but partially incomplete.

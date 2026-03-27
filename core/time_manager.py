@@ -7,6 +7,7 @@ Timezone: Europe/Podgorica (CET/CEST)
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from enum import Enum
 
 logger = logging.getLogger("apex.time_manager")
 
@@ -16,10 +17,15 @@ TZ = ZoneInfo("Europe/Podgorica")
 
 # Базовые окна сессий (в минутах от полуночи)
 _SESSION_WINDOWS = {
-    "session_asia":      (1 * 60,        10 * 60),      # 01:00–10:00  Токио
-    "session_hong_kong": (3 * 60,        12 * 60),      # 03:00–12:00  Гонконг
-    "session_london":    (10 * 60,       19 * 60),      # 10:00–19:00  Лондон
-    "session_new_york":  (15 * 60 + 30,  22 * 60),      # 15:30–22:00  Нью-Йорк
+    "session_asia":      (1 * 60,        3 * 60),        # 01:00–03:00  Токио
+    "session_hong_kong": (2 * 60 + 30,   4 * 60 + 30),   # 02:30–04:30  Гонконг
+    "session_london":    (9 * 60,        11 * 60),        # 09:00–11:00  Лондон
+    "session_new_york":  (14 * 60 + 30,  16 * 60 + 30),  # 14:30–16:30  Нью-Йорк
+    # ── ТЕСТ-БЛОК ──────────────────────────────────────────────────────
+    "session_test1":     (11 * 60 + 30,  13 * 60 + 30),  # 11:30–13:30  Тест 1
+    "session_test2":     (17 * 60,       19 * 60),        # 17:00–19:00  Тест 2
+    "session_test3":     (6  * 60,       8  * 60),        # 06:00–08:00  Тест 3
+    # ── КОНЕЦ ТЕСТ-БЛОКА ────────────────────────────────────────────────
 }
 
 _SESSION_LABELS = {
@@ -27,7 +33,78 @@ _SESSION_LABELS = {
     "session_hong_kong": "HONG_KONG",
     "session_london":    "LONDON",
     "session_new_york":  "NEW_YORK",
+    "session_test1":     "TEST_1",
+    "session_test2":     "TEST_2",
+    "session_test3":     "TEST_3",
 }
+
+# Маппинг label → ключ _SESSION_WINDOWS
+_LABEL_TO_KEY = {v: k for k, v in _SESSION_LABELS.items()}
+
+
+class SessionPhase(Enum):
+    PRE_SESSION = "PRE_SESSION"
+    EXECUTION   = "EXECUTION"
+    OBSERVATION = "OBSERVATION"
+    HARD_CLOSE  = "HARD_CLOSE"
+    OFF         = "OFF"
+
+
+def get_session_phase(session_name: str = None) -> tuple["SessionPhase", str, int]:
+    """
+    Определяет фазу сессии по текущему времени (Europe/Podgorica).
+
+    Если session_name=None — берёт последнюю начавшуюся активную сессию.
+
+    Returns:
+        (phase, session_name, minutes_elapsed)
+        minutes_elapsed — минут от session_open (отрицательные = до открытия)
+    """
+    now_pg = datetime.now(TZ)
+    total_minutes = now_pg.hour * 60 + now_pg.minute
+
+    # Если session_name задан — считаем для конкретной сессии
+    if session_name:
+        key = _LABEL_TO_KEY.get(session_name)
+        if not key:
+            return SessionPhase.OFF, session_name, 0
+        start = _SESSION_WINDOWS[key][0]
+        minutes_elapsed = total_minutes - start
+
+        if minutes_elapsed < -30:
+            return SessionPhase.OFF, session_name, minutes_elapsed
+        elif minutes_elapsed < 0:
+            return SessionPhase.PRE_SESSION, session_name, minutes_elapsed
+        elif minutes_elapsed < 90:
+            return SessionPhase.EXECUTION, session_name, minutes_elapsed
+        elif minutes_elapsed < 120:
+            return SessionPhase.OBSERVATION, session_name, minutes_elapsed
+        else:
+            return SessionPhase.HARD_CLOSE, session_name, minutes_elapsed
+
+    # Авто-определение: найти все активные сессии
+    best = None
+    for key, (start, end) in _SESSION_WINDOWS.items():
+        label = _SESSION_LABELS[key]
+        minutes_elapsed = total_minutes - start
+        # Рассматриваем сессии от −30 мин до конца окна
+        if -30 <= minutes_elapsed and total_minutes < end:
+            if best is None or start > best[1]:
+                best = (label, start, minutes_elapsed)
+
+    if not best:
+        return SessionPhase.OFF, "OFF", 0
+
+    label, start, minutes_elapsed = best
+    if minutes_elapsed < 0:
+        return SessionPhase.PRE_SESSION, label, minutes_elapsed
+    elif minutes_elapsed < 90:
+        return SessionPhase.EXECUTION, label, minutes_elapsed
+    elif minutes_elapsed < 120:
+        return SessionPhase.OBSERVATION, label, minutes_elapsed
+    else:
+        return SessionPhase.HARD_CLOSE, label, minutes_elapsed
+
 
 # SESSIONS — для TimeManager.current_session() и handlers.py (часы, Podgorica)
 SESSIONS = {

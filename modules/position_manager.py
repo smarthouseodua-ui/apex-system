@@ -7,6 +7,7 @@ import logging
 from datetime import datetime
 from pytz import timezone as tz
 from core.event_bus import EventBus
+from core.time_manager import SessionPhase, get_session_phase
 
 PODGORICA = tz("Europe/Podgorica")
 from storage.db.repository import Repository
@@ -101,15 +102,71 @@ class PositionManager:
                     self._activate_breakeven(position)
                 return
 
-        # --- Таймаут (проверяется последним) ---
-        max_minutes = self.config.get("risk", {}).get("max_trade_minutes", 40)
+        # --- HARD_CLOSE: 120-я минута сессии (приоритет над таймаутом) ---
+        session_name = position.get("session_name")
+        if session_name:
+            phase, _, minutes_elapsed = get_session_phase(session_name)
+
+            # FORCE_CLOSE на 120-й минуте
+            if phase == SessionPhase.HARD_CLOSE and position.get("status") == "open":
+                position["close_event_type"] = "FORCE_CLOSE_120M"
+                position["result_label"] = "force_close"
+                position["minutes_to_close"] = minutes_elapsed
+                logger.info(
+                    f"FORCE_CLOSE_120M [{session_name}] {symbol}: "
+                    f"session min={minutes_elapsed} — closing"
+                )
+                await self._close_position(position, "FORCE_CLOSE_120M")
+                return
+
+            # OBSERVATION MODE: фиксация статуса на 90-й минуте
+            if phase == SessionPhase.OBSERVATION and not position.get("entered_observation"):
+                entry = position.get("fill_price") or position.get("entry")
+                if entry and current_price:
+                    if direction == "long":
+                        status_at_90 = "in_profit" if current_price > entry else (
+                            "breakeven" if current_price == entry else "in_loss"
+                        )
+                    else:
+                        status_at_90 = "in_profit" if current_price < entry else (
+                            "breakeven" if current_price == entry else "in_loss"
+                        )
+                else:
+                    status_at_90 = "unknown"
+
+                position["entered_observation"] = True
+                position["observation_start_time"] = datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S")
+                position["status_at_90m"] = status_at_90
+                position["minutes_alive_at_90m"] = minutes_elapsed
+                logger.info(
+                    f"OBSERVATION MODE [{session_name}] {symbol}: "
+                    f"status={status_at_90}, session_min={minutes_elapsed}"
+                )
+
+        # --- Таймаут позиции (резервный, проверяется последним) ---
+        max_minutes = self.config.get("risk", {}).get("max_trade_minutes", 90)
         opened_at_str = position.get("opened_at")
         if opened_at_str:
             try:
                 opened_at = datetime.fromisoformat(opened_at_str)
                 elapsed = (datetime.now() - opened_at).total_seconds() / 60
+
+                # 90 мин — принудительное закрытие в любом случае
                 if elapsed >= max_minutes:
                     await self._close_position(position, "TIMEOUT")
+                    return
+
+                # 60 мин — закрыть только если в плюсе
+                if elapsed >= 60:
+                    entry = position.get("fill_price") or position.get("entry")
+                    if entry and current_price:
+                        if direction == "long":
+                            in_profit = current_price > entry
+                        else:
+                            in_profit = current_price < entry
+                        if in_profit:
+                            await self._close_position(position, "TIMEOUT_PROFIT_60")
+                            return
             except Exception:
                 pass
 

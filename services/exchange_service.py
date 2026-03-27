@@ -3,6 +3,7 @@ APEX PROTOCOL™ — Exchange Service
 Подключение к биржам через ccxt. Получение рыночных данных.
 """
 
+import os
 import ccxt.async_support as ccxt
 import logging
 from datetime import datetime
@@ -17,19 +18,20 @@ class ExchangeService:
         self.exchange = None
 
     async def connect(self):
-        """Подключение к бирже."""
-        cfg = self.config.get("exchanges", {}).get("binance_futures", {})
+        """Подключение к бирже. Ключи из ENV."""
+        api_key = os.getenv("BYBIT_API_KEY")
+        api_secret = os.getenv("BYBIT_API_SECRET")
 
-        self.exchange = ccxt.binance({
-            "apiKey": cfg.get("api_key", ""),
-            "secret": cfg.get("api_secret", ""),
+        self.exchange = ccxt.bybit({
+            "apiKey": api_key,
+            "secret": api_secret,
             "options": {
                 "defaultType": "future",
             },
             "enableRateLimit": True,
         })
 
-        logger.info("ExchangeService: connected to Binance Futures")
+        logger.info("ExchangeService: connected to Bybit Futures")
 
     async def get_tickers(self, symbols: list = None) -> dict:
         """Получить тикеры."""
@@ -70,6 +72,30 @@ class ExchangeService:
         except Exception as e:
             logger.error(f"get_futures_symbols error: {e}")
             return []
+
+    async def test_connection(self):
+        """Безопасный тест API — только чтение, без ордеров."""
+        try:
+            balance = await self.exchange.fetch_balance()
+            total_usdt = balance.get("USDT", {}).get("total", 0)
+            free_usdt = balance.get("USDT", {}).get("free", 0)
+            logger.info(f"[EXCHANGE] API OK | USDT total={total_usdt} free={free_usdt}")
+            return {
+                "status": "OK",
+                "total_usdt": total_usdt,
+                "free_usdt": free_usdt,
+            }
+        except Exception as e:
+            logger.error(f"[EXCHANGE] API ERROR: {e}")
+            return {
+                "status": "ERROR",
+                "error": str(e),
+            }
+
+    async def create_order(self, symbol: str, side: str, amount: float, order_type: str = "market", params: dict | None = None):
+        """Отправить ордер на биржу."""
+        params = params or {}
+        return await self.exchange.create_order(symbol, order_type, side, amount, None, params)
 
     async def close(self):
         """Закрыть соединение."""

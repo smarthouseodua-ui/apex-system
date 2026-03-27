@@ -1,517 +1,321 @@
 """
 APEX PROTOCOL™ — Strategy Engine
-Каркас. Тестовые стратегии: SESSION_ORB_5M, FIRST_10M_BREAKOUT, PREV_CANDLE_BREAKOUT.
-Отдельный режим: FIRST_5M_SESSION.
-Пишет в SKL01_T02_strategy_log.
+ORB (Opening Range Breakout) — строго по APEX_ORB_UNIFIED_SPEC v1.0
+Логика: BUILD_ORB → BREAKOUT → RETEST → CONFIRM → SIGNAL
 """
 
 import logging
-from datetime import datetime
-from pytz import timezone as tz
-from core.event_bus import EventBus
-
-PODGORICA = tz("Europe/Podgorica")
-from services.exchange_service import ExchangeService
-from storage.db.repository import Repository
+from datetime import datetime, timedelta, timezone
+import pytz
 
 logger = logging.getLogger("apex.strategy_engine")
 
-SESSION_OPEN_HOURS = [8, 12, 17]
+PODGORICA = pytz.timezone("Europe/Podgorica")
+
+SESSION_TZ = {
+    "TOKYO":     pytz.timezone("Asia/Tokyo"),
+    "HONG_KONG": pytz.timezone("Asia/Hong_Kong"),
+    "LONDON":    pytz.timezone("Europe/London"),
+    "NEW_YORK":  pytz.timezone("America/New_York"),
+    "TEST_1":    pytz.timezone("Europe/Podgorica"),
+    "TEST_2":    pytz.timezone("Europe/Podgorica"),
+    "TEST_3":    pytz.timezone("Europe/Podgorica"),
+}
 
 
 class StrategyEngine:
 
-    def __init__(self, config: dict, event_bus: EventBus):
+    def __init__(self, config: dict, event_bus=None):
         self.config = config
         self.event_bus = event_bus
-        self.exchange_service = ExchangeService(config)
-        self.repo = Repository()
+        self.exchange_service = None
         self._connected = False
-        # hourly test: {target_hour: set(symbols already traded)}
-        self._hourly_trades: dict[int, set] = {}
+        self.repo = None
+        self._orb_states: dict[str, dict] = {}
 
     async def _ensure_connected(self):
         if not self._connected:
+            from services.exchange_service import ExchangeService
+            self.exchange_service = ExchangeService(self.config)
             await self.exchange_service.connect()
             self._connected = True
-
-    def _current_session_hour(self) -> int | None:
-        now = datetime.now(PODGORICA)
-        if now.hour in SESSION_OPEN_HOURS and now.minute < 5:
-            return now.hour
-        return None
+        if self.repo is None:
+            from storage.db.repository import Repository
+            self.repo = Repository()
 
     async def analyze(self, candidates: list) -> list:
         try:
             await self._ensure_connected()
+            session_name, session_open_utc = self._get_active_session()
+            if not session_name or not session_open_utc:
+                logger.info("StrategyEngine: нет активной сессии")
+                return []
 
-            # --- FIRST_5M_SESSION: отдельный режим, не зависит от hourly_test ---
-            try:
-                from services.test_control import read as tc_read
-                tc = tc_read()
-            except Exception:
-                tc = {}
+            now_utc = datetime.now(timezone.utc)
+            exec_window_end = session_open_utc + timedelta(minutes=90)
 
-            if tc.get("mode") == "FIRST_5M_SESSION":
-                return await self.run_first_5m_session(candidates)
+            if now_utc < session_open_utc:
+                logger.info(f"StrategyEngine [{session_name}]: сессия ещё не открылась")
+                return []
+            if now_utc >= exec_window_end:
+                logger.info(f"StrategyEngine [{session_name}]: Execution Window закрыто")
+                return []
 
-            if self.config.get("_hourly_test"):
-                return await self._hourly_test_analyze(candidates)
+            logger.info(f"StrategyEngine [{session_name}]: сканируем {len(candidates)} кандидатов")
 
             signals = []
-            now = datetime.now(PODGORICA)
-            session_hour = now.hour
-
-            logger.info(f"StrategyEngine: hour={session_hour}:00 — сканирую {len(candidates)} кандидатов")
-
             for candidate in candidates:
-                signal = await self._session_orb_signal(candidate, session_hour)
+                signal = await self._process_candidate(candidate, session_name, session_open_utc, now_utc)
                 if signal:
-                    self.repo.log_strategy(signal)
                     signals.append(signal)
+                    break  # MAX 1 активная сделка
 
-            logger.info(f"StrategyEngine: {len(signals)} сигналов")
-            await self.event_bus.publish("strategy.done", {"signals": signals})
+            logger.info(f"StrategyEngine [{session_name}]: {len(signals)} сигналов")
+
+            if self.repo:
+                for s in signals:
+                    self.repo.log_strategy(s)
+
             return signals
+
         except Exception as e:
             logger.error(f"StrategyEngine error: {e}", exc_info=True)
             return []
 
-    # ── FIRST_5M_SESSION ─────────────────────────────────────────────────────
-
-    async def run_first_5m_session(self, candidates: list) -> list:
-        """
-        FIRST_5M_SESSION — отдельный режим, не зависит от hourly_test.
-
-        1. Читает start_time и fired из test_control
-        2. Если fired == True → return []
-        3. Для каждого кандидата берёт 10 свечей 5m
-        4. Находит первую свечу, close_time которой > start_time
-        5. Если свеча ещё не закрыта → пропуск
-        6. LONG:  first_close > prev_high
-           SHORT: first_close < prev_low
-        7. После первого сигнала → tc_write(first_5m_fired=True), выход
-        """
+    async def _process_candidate(self, candidate, session_name, session_open_utc, now_utc):
+        symbol = candidate.get("symbol")
         try:
-            from services.test_control import read as tc_read, write as tc_write
-            tc = tc_read()
-        except Exception:
-            logger.error("FIRST_5M_SESSION: не удалось прочитать test_control")
-            return []
+            orb = await self._build_orb(symbol, session_open_utc)
+            if not orb:
+                return None
 
-        # Уже сработала — пропуск
-        if tc.get("first_5m_fired"):
-            logger.info("FIRST_5M_SESSION: уже сработала (fired=True) — пропуск")
-            return []
+            breakout = await self._detect_breakout(symbol, orb, session_open_utc)
+            if not breakout:
+                return None
 
-        # Парсим start_time
-        start_time_str = tc.get("first_5m_session_start")
-        if not start_time_str:
-            logger.warning("FIRST_5M_SESSION: нет first_5m_session_start — пропуск")
-            return []
+            retest = await self._wait_retest(symbol, orb, breakout)
+            if not retest:
+                return None
 
-        try:
-            start_time = datetime.strptime(start_time_str, "%Y-%m-%dT%H:%M:%S")
-        except (ValueError, TypeError):
-            logger.error(f"FIRST_5M_SESSION: неверный формат start_time: {start_time_str}")
-            return []
+            confirmation = await self._confirm_entry(symbol, breakout["direction"])
+            if not confirmation:
+                return None
 
-        # start_time в миллисекундах для сравнения с candle timestamp
-        start_ts_ms = int(start_time.timestamp() * 1000)
+            exec_window_end = session_open_utc + timedelta(minutes=90)
+            if datetime.now(timezone.utc) >= exec_window_end:
+                logger.info(f"[CANCEL] {symbol}: время вышло за Execution Window")
+                return None
 
-        now = datetime.now(PODGORICA)
-        now_ts_ms = int(now.timestamp() * 1000)
+            direction   = breakout["direction"]
+            entry_price = confirmation["entry_price"]
 
-        logger.info(
-            f"FIRST_5M_SESSION: start={start_time_str}, "
-            f"кандидатов={len(candidates)}, ожидаю закрытия первой 5m свечи"
-        )
+            if direction == "long":
+                sl = retest["low"]
+                R  = entry_price - sl
+            else:
+                sl = retest["high"]
+                R  = sl - entry_price
 
-        signals = []
+            if R <= 0:
+                logger.warning(f"[CANCEL] {symbol}: R <= 0")
+                return None
 
-        for candidate in candidates:
-            symbol = candidate["symbol"]
-            try:
-                candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=10)
-                if len(candles) < 2:
-                    continue
+            tp1 = entry_price + R   if direction == "long" else entry_price - R
+            tp2 = entry_price + 2*R if direction == "long" else entry_price - 2*R
+            tp3 = entry_price + 3*R if direction == "long" else entry_price - 3*R
 
-                # candles отсортированы от старой к новой: [oldest, ..., newest]
-                # Каждая свеча: [timestamp_ms, open, high, low, close, volume]
-                # timestamp_ms — время ОТКРЫТИЯ свечи
-                # close_time = timestamp_ms + 5 * 60 * 1000
+            obs_start  = session_open_utc + timedelta(minutes=90)
+            hard_close = session_open_utc + timedelta(minutes=120)
+            tz         = SESSION_TZ.get(session_name, PODGORICA)
+            now_local  = datetime.now(tz)
 
-                first_candle = None
-                prev_candle = None
+            signal = {
+                "symbol":                   symbol,
+                "direction":                direction,
+                "session_name":             session_name,
+                "timezone":                 str(tz),
+                "strategy":                 "APEX_ORB",
+                "timeframe":                "5m",
+                "session_open_time":        session_open_utc.isoformat(),
+                "execution_window_start":   session_open_utc.isoformat(),
+                "execution_window_end":     exec_window_end.isoformat(),
+                "observation_window_start": obs_start.isoformat(),
+                "hard_close_time":          hard_close.isoformat(),
+                "orb_high":                 orb["orb_high"],
+                "orb_low":                  orb["orb_low"],
+                "orb_mid":                  orb["orb_mid"],
+                "orb_size":                 orb["orb_size"],
+                "entry":                    round(entry_price, 6),
+                "entry_price":              round(entry_price, 6),
+                "entry_time":               now_local.strftime("%Y-%m-%d %H:%M %Z"),
+                "entry_hour":               now_local.hour,
+                "entry_minute":             now_local.minute,
+                "sl":                       round(sl, 6),
+                "tp1":                      round(tp1, 6),
+                "tp2":                      round(tp2, 6),
+                "tp3":                      round(tp3, 6),
+                "risk_R_value":             round(R, 6),
+                "confidence":               1.0,
+                "generated_at":             datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S"),
+                "score":                    candidate.get("score"),
+                "price":                    candidate.get("price"),
+                "ema":                      candidate.get("ema"),
+                "reasons":                  candidate.get("reasons", []),
+                "candidate_status":         candidate.get("candidate_status"),
+                "scanned_at":               candidate.get("scanned_at"),
+            }
 
-                for i, candle in enumerate(candles):
-                    candle_open_ts = candle[0]
-                    candle_close_ts = candle_open_ts + 5 * 60 * 1000  # +5 минут
-
-                    # Ищем первую свечу, которая закрылась ПОСЛЕ start_time
-                    if candle_close_ts > start_ts_ms:
-                        # Проверяем что свеча уже закрыта (close_time <= now)
-                        if candle_close_ts > now_ts_ms:
-                            # Свеча ещё не закрыта — ждём
-                            break
-
-                        first_candle = candle
-                        if i > 0:
-                            prev_candle = candles[i - 1]
-                        break
-
-                if first_candle is None or prev_candle is None:
-                    continue
-
-                first_close = first_candle[4]   # close первой свечи
-                prev_high   = prev_candle[2]    # high предыдущей
-                prev_low    = prev_candle[3]    # low предыдущей
-
-                if prev_high <= prev_low:
-                    continue
-
-                current_price = candidate["price"]
-
-                if first_close > prev_high:
-                    direction = "long"
-                elif first_close < prev_low:
-                    direction = "short"
-                else:
-                    continue
-
-                signal = {
-                    "symbol":       symbol,
-                    "direction":    direction,
-                    "entry":        round(current_price, 6),
-                    "strategy":     "FIRST_5M_SESSION",
-                    "timeframe":    "5m",
-                    "session_hour": now.hour,
-                    "first_close":  first_close,
-                    "prev_high":    prev_high,
-                    "prev_low":     prev_low,
-                    "confidence":   1.0,
-                    "generated_at": now.strftime("%Y-%m-%dT%H:%M:%S"),
-                }
-
-                self.repo.log_strategy(signal)
-                signals.append(signal)
-
-                # 1 сигнал = 1 сделка — помечаем как сработавшую
-                try:
-                    tc_write({"first_5m_fired": True})
-                except Exception:
-                    pass
-
-                logger.info(
-                    f"FIRST_5M_SESSION: сигнал {direction} {symbol} "
-                    f"(first_close={first_close}, prev_high={prev_high}, prev_low={prev_low})"
-                )
-                break  # Один сигнал — выход
-
-            except Exception as e:
-                logger.error(f"FIRST_5M_SESSION error {symbol}: {e}")
-                continue
-
-        if not signals:
-            logger.info("FIRST_5M_SESSION: нет сигналов в этом цикле")
-
-        await self.event_bus.publish("strategy.done", {"signals": signals})
-        return signals
-
-    # ── HOURLY TEST ──────────────────────────────────────────────────────────
-
-    async def _hourly_test_analyze(self, candidates: list) -> list:
-        """
-        Часовой тест: SESSION_ORB_5M, FIRST_10M_BREAKOUT, PREV_CANDLE_BREAKOUT.
-        Один вход на символ в час. Только simulation.
-        """
-        now = datetime.now(PODGORICA)
-
-        try:
-            from services.test_control import read as tc_read, write as tc_write
-            tc = tc_read()
-        except Exception:
-            tc = {}
-
-        active_filter = tc.get("active_filter", "SESSION_ORB_5M")
-        manual_mode   = tc.get("manual_hour_enabled", False)
-        selected_hour = tc.get("selected_hour")
-
-        if manual_mode and selected_hour is not None:
-            target_hour = selected_hour
             logger.info(
-                f"HourlyTest MANUAL: целевой час={target_hour}:00, "
-                f"текущее время={now.hour}:{now.minute:02d}"
+                f"[SIGNAL] {symbol} {direction.upper()} | "
+                f"entry={entry_price:.4f} SL={sl:.4f} "
+                f"TP1={tp1:.4f} TP2={tp2:.4f} TP3={tp3:.4f} R={R:.6f}"
             )
-        else:
-            target_hour = now.hour
+            return signal
 
-            if active_filter == "PREV_CANDLE_BREAKOUT":
-                # Без ограничений по минутам — работает каждый цикл
-                pass
-            elif active_filter == "FIRST_10M_BREAKOUT":
-                # Вход только в минуты 10–14
-                if now.minute < 10 or now.minute >= 15:
-                    logger.info(
-                        f"HourlyTest FIRST_10M_BREAKOUT: вне окна входа "
-                        f"(минута={now.minute}, нужно 10–14) — пропуск"
-                    )
-                    return []
-            else:
-                # SESSION_ORB_5M и прочие: первые 5 минут
-                if now.minute >= 5:
-                    logger.info(f"HourlyTest AUTO: вне окна (минута={now.minute}) — пропуск")
-                    return []
+        except Exception as e:
+            logger.error(f"_process_candidate {symbol}: {e}", exc_info=True)
+            return None
 
-        # Сбрасываем словарь если начался новый час
-        if target_hour not in self._hourly_trades:
-            self._hourly_trades = {target_hour: set()}
-
-        already_traded = self._hourly_trades[target_hour]
-        signals = []
-
-        logger.info(
-            f"HourlyTest [{active_filter}]: час={target_hour}:00 — "
-            f"сканирую {len(candidates)} кандидатов, "
-            f"уже торговано: {len(already_traded)}"
-        )
-
-        for candidate in candidates:
-            symbol = candidate["symbol"]
-            # PREV_CANDLE_BREAKOUT: не блокируем по already_traded —
-            # повторный вход разрешён после закрытия позиции (дедупликация через SignalGate)
-            if active_filter != "PREV_CANDLE_BREAKOUT" and symbol in already_traded:
-                continue
-
-            if active_filter == "PREV_CANDLE_BREAKOUT":
-                signal = await self._prev_candle_breakout_signal(candidate, target_hour)
-            elif active_filter == "FIRST_10M_BREAKOUT":
-                signal = await self._first_10m_breakout_signal(candidate, target_hour)
-                if signal:
-                    signal["strategy"] = "FIRST_10M_BREAKOUT"
-            elif manual_mode:
-                signal = await self._manual_open_signal(candidate, target_hour)
-            else:
-                signal = await self._session_orb_signal(candidate, target_hour)
-                if signal:
-                    signal["strategy"] = "HOURLY_ORB_5M"
-
-            if signal:
-                if active_filter != "PREV_CANDLE_BREAKOUT":
-                    already_traded.add(symbol)
-                self.repo.log_strategy(signal)
-                signals.append(signal)
-
-        logger.info(f"HourlyTest [{active_filter}]: час={target_hour}:00 → {len(signals)} сигналов")
-
-        # Записываем ORB диапазон в state после первого сигнала
-        if signals and manual_mode:
-            try:
-                first = signals[0]
-                tc_write({
-                    "selected_hour_orb_high": first.get("orb_high"),
-                    "selected_hour_orb_low":  first.get("orb_low"),
-                })
-            except Exception:
-                pass
-
-        await self.event_bus.publish("strategy.done", {"signals": signals})
-        return signals
-
-    # ── SIGNAL METHODS ───────────────────────────────────────────────────────
-
-    async def _prev_candle_breakout_signal(self, candidate: dict, session_hour: int) -> dict | None:
-        """
-        PREV CANDLE BREAKOUT (тестовый режим непрерывной генерации):
-        - Берёт последнюю закрытую 5m свечу (candles[1] из limit=3)
-        - Если current_price > prev_high → LONG
-        - Если current_price < prev_low  → SHORT
-        - Очень частое условие — высокий поток сигналов для теста каркаса
-        """
-        symbol = candidate["symbol"]
+    async def _build_orb(self, symbol, session_open_utc):
         try:
-            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=3)
-            if len(candles) < 2:
+            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=10)
+            if not candles or len(candles) < 2:
                 return None
 
-            prev_candle = candles[1]   # последняя закрытая свеча
-            prev_high = prev_candle[2]
-            prev_low  = prev_candle[3]
+            open_ts_ms    = int(session_open_utc.timestamp() * 1000)
+            range_end_ms  = open_ts_ms + 5 * 60 * 1000
+            now_ms        = int(datetime.now(timezone.utc).timestamp() * 1000)
 
-            if prev_high <= prev_low:
-                return None
+            range_candle = None
+            for c in candles:
+                if c[0] >= open_ts_ms and (c[0] + 5*60*1000) <= now_ms:
+                    range_candle = c
+                    break
 
-            current_price = candidate["price"]
+            if not range_candle:
+                range_candle = candles[-2]
 
-            if current_price > prev_high:
-                direction = "long"
-                entry = round(current_price, 6)
-                sl    = round(entry * (1 - 0.004), 6)
-            elif current_price < prev_low:
-                direction = "short"
-                entry = round(current_price, 6)
-                sl    = round(entry * (1 + 0.004), 6)
-            else:
+            orb_high = range_candle[2]
+            orb_low  = range_candle[3]
+            orb_size = orb_high - orb_low
+
+            if orb_size <= 0:
                 return None
 
             return {
-                "symbol":       symbol,
-                "direction":    direction,
-                "entry":        entry,
-                "sl":           sl,
-                "strategy":     "PREV_CANDLE_BREAKOUT",
-                "timeframe":    "5m",
-                "session_hour": session_hour,
-                "orb_high":     prev_high,
-                "orb_low":      prev_low,
-                "confidence":   1.0,
-                "generated_at": datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S"),
+                "orb_high": round(orb_high, 6),
+                "orb_low":  round(orb_low,  6),
+                "orb_mid":  round((orb_high + orb_low) / 2, 6),
+                "orb_size": round(orb_size, 6),
             }
         except Exception as e:
-            logger.error(f"PREV_CANDLE_BREAKOUT error {symbol}: {e}")
+            logger.error(f"_build_orb {symbol}: {e}")
             return None
 
-    async def _first_10m_breakout_signal(self, candidate: dict, session_hour: int) -> dict | None:
-        """
-        FIRST 10M BREAKOUT:
-        - Берёт первые 2 свечи 5m текущего часа (= 10 минут)
-        - first_high = max HIGH двух свечей
-        - first_low  = min LOW  двух свечей
-        - Если current_price > first_high → LONG
-        - Если current_price < first_low  → SHORT
-        """
-        symbol = candidate["symbol"]
+    async def _detect_breakout(self, symbol, orb, session_open_utc):
         try:
-            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=3)
-            if len(candles) < 2:
+            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=20)
+            if not candles:
                 return None
 
-            c0, c1 = candles[0], candles[1]
-            first_high = max(c0[2], c1[2])
-            first_low  = min(c0[3], c1[3])
+            range_end_ts = int(session_open_utc.timestamp() * 1000) + 5 * 60 * 1000
 
-            if first_high <= first_low:
-                return None
+            for c in candles:
+                if c[0] < range_end_ts:
+                    continue
+                candle_close = c[4]
+                if candle_close > orb["orb_high"]:
+                    return {"direction": "long",  "candle_ts": c[0], "candle_close": candle_close}
+                elif candle_close < orb["orb_low"]:
+                    return {"direction": "short", "candle_ts": c[0], "candle_close": candle_close}
 
-            current_price = candidate["price"]
-
-            if current_price > first_high:
-                direction = "long"
-                entry = round(current_price, 6)
-                sl    = round(entry * (1 - 0.004), 6)
-            elif current_price < first_low:
-                direction = "short"
-                entry = round(current_price, 6)
-                sl    = round(entry * (1 + 0.004), 6)
-            else:
-                return None
-
-            return {
-                "symbol":       symbol,
-                "direction":    direction,
-                "entry":        entry,
-                "sl":           sl,
-                "strategy":     "FIRST_10M_BREAKOUT",
-                "timeframe":    "5m",
-                "session_hour": session_hour,
-                "orb_high":     first_high,
-                "orb_low":      first_low,
-                "confidence":   1.0,
-                "generated_at": datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S"),
-            }
+            return None
         except Exception as e:
-            logger.error(f"FIRST_10M_BREAKOUT error {symbol}: {e}")
+            logger.error(f"_detect_breakout {symbol}: {e}")
             return None
 
-    async def _manual_open_signal(self, candidate: dict, session_hour: int) -> dict | None:
-        """
-        Ручной тест: сравниваем текущую цену с open первой 5м-свечи.
-        LONG  если current_price > open * 1.001
-        SHORT если current_price < open * 0.999
-        """
-        symbol = candidate["symbol"]
+    async def _wait_retest(self, symbol, orb, breakout):
         try:
-            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=2)
-            if len(candles) < 1:
+            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=20)
+            if not candles:
                 return None
 
-            ref_candle = candles[0]
-            open_price = ref_candle[1]
-            orb_high   = ref_candle[2]
-            orb_low    = ref_candle[3]
-            current_price = candidate["price"]
+            direction   = breakout["direction"]
+            breakout_ts = breakout["candle_ts"]
+            orb_high    = orb["orb_high"]
+            orb_low     = orb["orb_low"]
 
-            if current_price > open_price * 1.001:
-                direction = "long"
-                entry = round(current_price, 6)
-                sl    = round(orb_low, 6)
-            elif current_price < open_price * 0.999:
-                direction = "short"
-                entry = round(current_price, 6)
-                sl    = round(orb_high, 6)
-            else:
-                return None
+            for c in candles:
+                if c[0] <= breakout_ts:
+                    continue
 
-            return {
-                "symbol":       symbol,
-                "direction":    direction,
-                "entry":        entry,
-                "sl":           sl,
-                "strategy":     "MANUAL_OPEN_5M",
-                "timeframe":    "5m",
-                "session_hour": session_hour,
-                "orb_high":     orb_high,
-                "orb_low":      orb_low,
-                "open_price":   open_price,
-                "confidence":   1.0,
-                "generated_at": datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S")
-            }
+                high  = c[2]; low = c[3]; close = c[4]
+
+                if direction == "long":
+                    if close < orb_high:
+                        return None  # инвалидация
+                    if low <= orb_high and close >= orb_high:
+                        return {"candle_ts": c[0], "high": high, "low": low, "close": close}
+                else:
+                    if close > orb_low:
+                        return None  # инвалидация
+                    if high >= orb_low and close <= orb_low:
+                        return {"candle_ts": c[0], "high": high, "low": low, "close": close}
+
+            return None
         except Exception as e:
-            logger.error(f"ManualOpenSignal error {symbol}: {e}")
+            logger.error(f"_wait_retest {symbol}: {e}")
             return None
 
-    async def _session_orb_signal(self, candidate: dict, session_hour: int) -> dict | None:
-        symbol = candidate["symbol"]
+    async def _confirm_entry(self, symbol, direction):
         try:
-            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=3)
-            if len(candles) < 2:
+            candles_1m = await self.exchange_service.get_ohlcv(symbol, "1m", limit=5)
+            if not candles_1m or len(candles_1m) < 2:
                 return None
 
-            session_candle = candles[0]
-            orb_high = session_candle[2]
-            orb_low  = session_candle[3]
+            prev = candles_1m[-2]
+            curr = candles_1m[-1]
 
-            if orb_high <= orb_low:
+            prev_open  = prev[1]; prev_high = prev[2]
+            prev_low   = prev[3]; prev_close = prev[4]
+            curr_open  = curr[1]; curr_high = curr[2]
+            curr_low   = curr[3]; curr_close = curr[4]
+
+            confirmed = False
+
+            if direction == "long":
+                engulfing = (curr_close > curr_open and prev_close < prev_open
+                             and curr_open <= prev_close and curr_close >= prev_open)
+                confirmed = engulfing or (curr_close > prev_high)
+
+            elif direction == "short":
+                engulfing = (curr_close < curr_open and prev_close > prev_open
+                             and curr_open >= prev_close and curr_close <= prev_open)
+                confirmed = engulfing or (curr_close < prev_low)
+
+            if not confirmed:
                 return None
 
-            current_price = candidate["price"]
+            return {"entry_price": curr_close, "candle_ts": curr[0]}
 
-            direction = None
-            if current_price > orb_high:
-                direction = "long"
-                entry = round(current_price, 6)
-                sl    = round(orb_low, 6)
-            elif current_price < orb_low:
-                direction = "short"
-                entry = round(current_price, 6)
-                sl    = round(orb_high, 6)
-
-            if not direction:
-                return None
-
-            return {
-                "symbol":       symbol,
-                "direction":    direction,
-                "entry":        entry,
-                "sl":           sl,
-                "strategy":     "SESSION_ORB_5M",
-                "timeframe":    "5m",
-                "session_hour": session_hour,
-                "orb_high":     orb_high,
-                "orb_low":      orb_low,
-                "confidence":   1.0,
-                "generated_at": datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S")
-            }
         except Exception as e:
-            logger.error(f"Session ORB error {symbol}: {e}")
+            logger.error(f"_confirm_entry {symbol}: {e}")
             return None
+
+    def _get_active_session(self):
+        try:
+            from core.session_engine import _ALL_SESSIONS, get_session_state
+            now_utc = datetime.now(timezone.utc)
+
+            for name in _ALL_SESSIONS:
+                state = get_session_state(name)
+                if state.get("фаза") == "ВХОД":
+                    open_str = _ALL_SESSIONS[name]["open"]
+                    h, m = map(int, open_str.split(":"))
+                    open_dt = now_utc.replace(hour=h, minute=m, second=0, microsecond=0)
+                    return name, open_dt
+
+            return None, None
+        except Exception as e:
+            logger.error(f"_get_active_session: {e}")
+            return None, None

@@ -184,7 +184,6 @@ class Orchestrator:
             if not self._pre_session_done.get(session):
                 logger.info(f"[{cycle_id}] ПОДГОТОВКА: SMC-анализ для {session}")
                 try:
-                    await self.scanner._ensure_connected()
                     await self.pre_session.analyze(session)
                     self._pre_session_done[session] = True
                 except Exception as e:

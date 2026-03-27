@@ -1,111 +1,124 @@
-"""
-APEX PROTOCOL™ — Execution Engine
-Исполняет ордера. Пишет в SKL01_T05_execution_log.
-"""
+# execution_engine.py
 
-import logging
 from datetime import datetime
-from pytz import timezone as tz
-from core.event_bus import EventBus
+from modules.position_monitor import add_position
+from modules.risk_manager import can_trade, get_state
+from modules.telegram_control import get_mode
+from modules.config import MODE, DEFAULT_BALANCE
+from modules.exchange_client import ExchangeClient
 
-PODGORICA = tz("Europe/Podgorica")
-from storage.db.repository import Repository
-from services.telegram_notifier import get_notifier
-from core.time_manager import time_features_for_dt
+OPEN_POSITIONS = {}
 
-logger = logging.getLogger("apex.execution_engine")
+MAX_POSITIONS = 5
+RISK_PER_TRADE = 0.01  # 1%
+
+client = ExchangeClient()
+client.connect()
 
 
-def _resolve_session(tf: dict) -> tuple[str, str]:
-    """Возвращает (session_name, session_label) по флагам из time_features_for_dt.
+def can_open(symbol: str) -> bool:
+    if symbol in OPEN_POSITIONS:
+        return False
+    if len(OPEN_POSITIONS) >= MAX_POSITIONS:
+        return False
+    return True
 
-    session_name  — для БД: ASIA, ASIA+HK, HONG_KONG, LONDON, LONDON+NY, NEW_YORK, OFF
-    session_label — человекочитаемая метка с уточнением (OPEN) и т.д.
-    """
-    asia     = tf.get("session_asia", 0)
-    hk       = tf.get("session_hong_kong", 0)
-    london   = tf.get("session_london", 0)
-    new_york = tf.get("session_new_york", 0)
-    lon_open = tf.get("event_london_open", 0)
-    ny_open  = tf.get("event_ny_open", 0)
 
-    if asia and hk:
-        return "ASIA+HK", "ASIA (HK)"
-    elif asia:
-        return "ASIA", "ASIA"
-    elif london and new_york:
-        label = "LONDON+NY (OPEN)" if ny_open else "LONDON+NY"
-        return "LONDON+NY", label
-    elif london:
-        label = "LONDON (OPEN)" if lon_open else "LONDON"
-        return "LONDON", label
-    elif new_york:
-        label = "NEW YORK (OPEN)" if ny_open else "NEW YORK"
-        return "NEW_YORK", label
-    elif hk:
-        return "HONG_KONG", "HONG KONG"
+def calculate_position_size(balance: float, price: float) -> float:
+    risk_amount = balance * RISK_PER_TRADE
+    size = risk_amount / price
+    return round(size, 6)
+
+
+def build_order(signal: dict, balance: float) -> dict:
+    symbol = signal["symbol"]
+    price = signal["price"]
+
+    size = calculate_position_size(balance, price)
+    notional = round(price * size, 2)
+
+    side = "LONG"
+
+    if side == "LONG":
+        sl = round(price * 0.99, 6)
+        tp1 = round(price * 1.01, 6)
+        tp2 = round(price * 1.02, 6)
+        tp3 = round(price * 1.03, 6)
     else:
-        return "OFF", "OFF"
+        sl = round(price * 1.01, 6)
+        tp1 = round(price * 0.99, 6)
+        tp2 = round(price * 0.98, 6)
+        tp3 = round(price * 0.97, 6)
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "entry_price": price,
+        "size": size,
+        "notional": notional,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "mode": MODE,
+        "timestamp": datetime.utcnow().isoformat()
+    }
 
 
-class ExecutionEngine:
+def execute(signal: dict, balance: float = DEFAULT_BALANCE):
+    symbol = signal["symbol"]
+    print(f"[EXECUTION TRY] {symbol}")
 
-    def __init__(self, config: dict, event_bus: EventBus, id_manager=None):
-        self.config = config
-        self.event_bus = event_bus
-        self.repo = Repository()
-        self.mode = config.get("mode", "simulation")
-        self.id_manager = id_manager
-
-    async def execute(self, orders: list) -> list:
-        try:
-            positions = []
-            for order in orders:
-                position = await self._execute_order(order)
-                if position:
-                    self.repo.log_execution(position)
-                    positions.append(position)
-                    try:
-                        notifier = get_notifier()
-                        if notifier:
-                            await notifier.notify_open(position)
-                    except Exception as e:
-                        logger.warning(f"notify_open error: {e}")
-
-            logger.info(f"ExecutionEngine [{self.mode}]: {len(positions)} positions opened")
-            await self.event_bus.publish("execution.done", {"positions": positions})
-            return positions
-        except Exception as e:
-            logger.error(f"ExecutionEngine error: {e}", exc_info=True)
-            return []
-
-    async def _execute_order(self, order: dict) -> dict | None:
-        if self.mode == "simulation":
-            return self._simulate(order)
-        elif self.mode == "live":
-            return await self._execute_live(order)
+    if get_mode() != "RUN":
+        print(f"[BLOCKED] {symbol} (mode={get_mode()})")
         return None
 
-    def _simulate(self, order: dict) -> dict:
-        trade_id = self.id_manager.next_trade_id() if self.id_manager else None
-        opened_at = datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S")
-        time_features = time_features_for_dt(opened_at)
-        session_name, session_label = _resolve_session(time_features)
-
-        return {
-            **order,
-            "trade_id": trade_id,
-            "status": "open",
-            "fill_price": order["entry"],
-            "slippage": 0.0,
-            "commission": 0.0,
-            "opened_at": opened_at,
-            "mode": "simulation",
-            **time_features,
-            "session_label": session_label,
-            "session_name": session_name,
-        }
-
-    async def _execute_live(self, order: dict) -> dict | None:
-        logger.warning("Live execution not implemented yet")
+    if not can_open(symbol):
+        print(f"[BLOCKED] {symbol} (already open or max positions)")
         return None
+
+    if not can_trade(len(OPEN_POSITIONS)):
+        print(f"[BLOCKED] {symbol} (risk manager)")
+        return None
+
+    # Safety check for LIVE
+    if MODE == "LIVE":
+        state = get_state()
+        if state["blocked"]:
+            print(f"[BLOCKED] {symbol} (risk blocked)")
+            return None
+        if balance <= 0:
+            print(f"[BLOCKED] {symbol} (no balance)")
+            return None
+
+    order = build_order(signal, balance)
+
+    # SIMULATION
+    if MODE == "SIMULATION":
+        OPEN_POSITIONS[symbol] = order
+        add_position(order)
+        print(f"[OPENED] {symbol} [SIM]")
+        return order
+
+    # PAPER
+    if MODE == "PAPER":
+        OPEN_POSITIONS[symbol] = order
+        add_position(order)
+        print(f"[OPENED] {symbol} [PAPER]")
+        return order
+
+    # LIVE
+    if MODE == "LIVE":
+        success = client.place_order(
+            symbol,
+            order["side"],
+            order["size"]
+        )
+
+        if success:
+            OPEN_POSITIONS[symbol] = order
+            add_position(order)
+            print(f"[OPENED] {symbol} [LIVE]")
+            return order
+
+    return None
