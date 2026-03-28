@@ -214,7 +214,7 @@ class Orchestrator:
         # --- ENTRY (ВХОД): полный pipeline ---
         try:
             # --- Сброс состояния SignalGate ---
-            self.signal_gate.reset()
+            self.signal_gate.reset(session_name=session)
 
             # --- Мониторинг существующих открытых позиций ---
             if self._open_positions:
@@ -407,4 +407,11 @@ class Orchestrator:
         """Остановка пайплайна."""
         self.running = False
         self.state_manager.set_state("stopped")
+        # Закрываем exchange соединения — предотвращаем утечку aiohttp
+        try:
+            if self.scanner and self.scanner.exchange_service:
+                await self.scanner.exchange_service.close()
+                logger.info("ExchangeService: connection closed on stop")
+        except Exception as e:
+            logger.warning(f"ExchangeService close error: {e}")
         logger.info("Pipeline stopped")

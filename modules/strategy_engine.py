@@ -120,6 +120,18 @@ class StrategyEngine:
                 logger.warning(f"[CANCEL] {symbol}: R <= 0")
                 return None
 
+            # Минимальный R: не менее 0.05% от цены входа
+            min_R = entry_price * 0.0005
+            if R < min_R:
+                logger.warning(f"[CANCEL] {symbol}: R={R:.6f} слишком мал (min={min_R:.6f})")
+                return None
+
+            # Минимальный R: не менее 0.05% от цены входа
+            min_R = entry_price * 0.0005
+            if R < min_R:
+                logger.warning(f"[CANCEL] {symbol}: R={R:.6f} слишком мал (min={min_R:.6f})")
+                return None
+
             tp1 = entry_price + R   if direction == "long" else entry_price - R
             tp2 = entry_price + 2*R if direction == "long" else entry_price - 2*R
             tp3 = entry_price + 3*R if direction == "long" else entry_price - 3*R

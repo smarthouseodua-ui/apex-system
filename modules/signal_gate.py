@@ -74,9 +74,14 @@ class SignalGate:
         self.repo = Repository()
         # Cross-cycle cooldown: symbol → datetime последнего approved
         self._recent_signals: dict[str, datetime] = {}
+        self._last_session: str = ""
 
-    def reset(self):
-        """Начало нового цикла. Cooldown НЕ сбрасывается — он cross-cycle."""
+    def reset(self, session_name: str = ""):
+        """Начало нового цикла. Cooldown сбрасывается при смене сессии."""
+        if session_name and session_name != self._last_session:
+            self._recent_signals.clear()
+            logger.info(f"SignalGate: cooldown CLEARED — new session {session_name}")
+            self._last_session = session_name
         logger.info(
             f"SignalGate: reset — cooldown entries: {len(self._recent_signals)}"
         )
