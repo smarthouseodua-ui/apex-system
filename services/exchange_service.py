@@ -49,6 +49,8 @@ class ExchangeService:
 
     async def get_ohlcv(self, symbol: str, timeframe: str = "15m", limit: int = 100) -> list:
         """Получить свечи OHLCV."""
+        import asyncio
+        await asyncio.sleep(0.2)
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             return ohlcv

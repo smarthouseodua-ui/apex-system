@@ -25,6 +25,14 @@ def can_open(symbol: str) -> bool:
 
 
 def calculate_position_size(balance: float, price: float) -> float:
+    try:
+        from services.test_control import read as tc_read
+        tc = tc_read()
+        fixed_size = tc.get("param_size_usdt", 0)
+        if fixed_size and fixed_size > 0:
+            return round(fixed_size / price, 6)
+    except Exception:
+        pass
     risk_amount = balance * RISK_PER_TRADE
     size = risk_amount / price
     return round(size, 6)
@@ -37,7 +45,7 @@ def build_order(signal: dict, balance: float) -> dict:
     size = calculate_position_size(balance, price)
     notional = round(price * size, 2)
 
-    side = "LONG"
+    side = signal.get("direction", "long").upper()
 
     if side == "LONG":
         sl = round(price * 0.99, 6)

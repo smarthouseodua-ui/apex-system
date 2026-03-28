@@ -1,22 +1,22 @@
 {
   "scanner": {
     "total_pairs": 545,
-    "after_liquidity": 491,
-    "after_volatility": 436,
+    "after_liquidity": 475,
+    "after_volatility": 429,
     "after_structure": 100,
     "scored": 100,
     "top_score": 73,
     "candidates": 7,
     "signals": 7,
-    "updated_at": "2026-03-28T08:38:35"
+    "updated_at": "2026-03-28T11:52:54"
   },
   "debug": {
     "stage_pairs": 545,
-    "stage_liquidity": 491,
-    "stage_volatility": 436,
+    "stage_liquidity": 475,
+    "stage_volatility": 429,
     "stage_structure": 100,
     "stage_scored": 100,
-    "stage_ema_filter": 94,
+    "stage_ema_filter": 83,
     "stage_sent_to_filter": 7,
     "stage_final": 7,
     "last_reject_reason": ""
