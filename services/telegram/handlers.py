@@ -255,8 +255,7 @@ def get_open_positions() -> list:
                    sl, tp1, tp2, tp3
             FROM SKL01_T05_execution_log
             WHERE status = 'open'
-            AND date(opened_at) = date('now')
-            ORDER BY opened_at DESC
+            ORDER BY rowid DESC
             """
         ).fetchall()
         conn.close()

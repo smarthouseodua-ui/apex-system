@@ -36,7 +36,7 @@ def add_position(order: dict):
             "tp3":          order.get("tp3"),
             "mode":         order.get("mode", "PAPER"),
             "status":       "open",
-            "opened_at":    order.get("opened_at", ""),
+            "opened_at":    order.get("opened_at") or datetime.utcnow().isoformat(),
             "trade_id":     order.get("trade_id", ""),
             "session_name": order.get("session_name", ""),
             "session_label": order.get("session_name", ""),
