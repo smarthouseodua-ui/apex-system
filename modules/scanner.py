@@ -1,3 +1,4 @@
+import asyncio
 """
 APEX PROTOCOL™ — Scanner
 Сканирует рынок, находит кандидатов. Пишет в SKL01_T01_scanner_log.
@@ -225,6 +226,7 @@ class Scanner:
         result = []
         for p in pairs:
             try:
+                await asyncio.sleep(0.5)  # throttle — защита от Rate Limit
                 ohlcv = await self.exchange_service.get_ohlcv(
                     p["symbol"], timeframe="15m", limit=ema_period + 5
                 )

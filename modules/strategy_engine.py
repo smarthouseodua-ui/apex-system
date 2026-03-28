@@ -94,8 +94,6 @@ class StrategyEngine:
                 return None
 
             retest = await self._wait_retest(symbol, orb, breakout)
-            if not retest:
-                return None
 
             confirmation = await self._confirm_entry(symbol, breakout["direction"])
             if not confirmation:
@@ -110,10 +108,10 @@ class StrategyEngine:
             entry_price = confirmation["entry_price"]
 
             if direction == "long":
-                sl = retest["low"]
+                sl = retest["low"] if retest else breakout["candle_close"] * 0.996
                 R  = entry_price - sl
             else:
-                sl = retest["high"]
+                sl = retest["high"] if retest else breakout["candle_close"] * 1.004
                 R  = sl - entry_price
 
             if R <= 0:

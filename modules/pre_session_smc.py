@@ -30,7 +30,7 @@ class PreSessionAnalyzer:
 
     async def analyze(self, session_name: str, symbol_limit: int = None) -> list[dict]:
         """Запускает SMC-анализ для всех пар universe перед сессией."""
-        limit = symbol_limit or self.config.get("pairs_limit", 200)
+        limit = symbol_limit or self.config.get("pairs_limit", 9999)
         today = datetime.now().strftime("%Y-%m-%d")
 
         if self.repo.get_pre_session_done(session_name, today):
