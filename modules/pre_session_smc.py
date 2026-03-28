@@ -52,6 +52,18 @@ class PreSessionAnalyzer:
         symbols = [s for s, _ in sorted_pairs]
 
         logger.info(f"[PRE_SESSION] {session_name}: analyzing {len(symbols)} pairs on 1H")
+        # Обновляем scanner_state для Telegram
+        from modules.runtime_state import update_scanner_state
+        update_scanner_state(
+            total_pairs=len(tickers),
+            after_liquidity=len(sorted_pairs),
+            after_volatility=len(sorted_pairs),
+            after_structure=len(symbols),
+            scored=len(symbols),
+            candidates=0,
+            signals=0,
+            top_score=0,
+        )
 
         now = datetime.now(timezone.utc)
         open_minutes = _SESSION_OPEN.get(session_name, 0)

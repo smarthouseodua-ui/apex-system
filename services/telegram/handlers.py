@@ -1,3 +1,11 @@
+from modules.runtime_state import load_runtime_state as _load_runtime_state
+
+def _get_scanner_state():
+    try:
+        return _load_runtime_state().get("scanner", {})
+    except:
+        return {}
+scanner_state = type("_SS", (), {"get": lambda self, k, d=0: _get_scanner_state().get(k, d)})()
 import logging
 import os
 import sqlite3
@@ -943,6 +951,12 @@ async def _handle_text_inner(update: Update, context: ContextTypes.DEFAULT_TYPE,
             f"<code>🎯 Входы       </code> {entries_icon}\n"
             f"<code>🛡 Монитор     </code> {monitor_icon}\n"
             f"<code>🔵 Исполнение  </code> simulation\n"
+            f"\n"
+            f"<code>📡 Universe    </code> <b>{scanner_state.get('total_pairs', 0)}</b>\n"
+            f"<code>💧 Ликвидность </code> <b>{scanner_state.get('after_liquidity', 0)}</b>\n"
+            f"<code>📈 Волатильность</code> <b>{scanner_state.get('after_volatility', 0)}</b>\n"
+            f"<code>🏗 Структура   </code> <b>{scanner_state.get('after_structure', 0)}</b>\n"
+            f"<code>🎯 Кандидаты   </code> <b>{scanner_state.get('candidates', 0)}</b>\n"
             "\n"
             f"<code>📊 Позиции     </code> <b>{open_cnt}</b>\n"
             f"<code>💰 PnL за день </code> <b>{sign}{pnl:.2f} USDT</b>\n"

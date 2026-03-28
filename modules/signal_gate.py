@@ -122,7 +122,7 @@ class SignalGate:
 
             # --- Session trade limit ---
             session_trades = self.repo.get_session_trade_count()
-            max_trades = self.config.get("max_trades_per_session", 5)
+            max_trades = self.config.get("max_trades_per_session", 9999)
             if session_trades >= max_trades:
                 logger.warning(f"[GATE] Session limit reached: {session_trades}/{max_trades}")
                 return []

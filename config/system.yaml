@@ -8,7 +8,7 @@ system:
   timezone: "Europe/Podgorica"
 
 scanner:
-  min_volume: 500000
+  min_volume: 100000
   min_volatility: 0.3
   max_volatility: 15.0
   max_candidates: 100

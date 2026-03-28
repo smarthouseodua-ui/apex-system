@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 SESSIONS = {
     "TOKYO":     {"open": "00:00", "no_watch": True},
     "HONG_KONG": {"open": "01:30"},
-    "LONDON":    {"open": "08:00"},
+    "LONDON":    {"open": "07:00"},
     "NEW_YORK":  {"open": "13:30"},
 }
 
