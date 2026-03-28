@@ -68,7 +68,6 @@ class StrategyEngine:
                 signal = await self._process_candidate(candidate, session_name, session_open_utc, now_utc)
                 if signal:
                     signals.append(signal)
-                    break  # MAX 1 активная сделка
 
             logger.info(f"StrategyEngine [{session_name}]: {len(signals)} сигналов")
 
