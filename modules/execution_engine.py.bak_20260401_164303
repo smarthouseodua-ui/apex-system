@@ -1,0 +1,233 @@
+# execution_engine.py
+
+from datetime import datetime
+from modules.position_monitor import add_position
+from services.telegram_notifier import get_notifier
+from modules.risk_manager import can_trade, get_state
+from modules.telegram_control import get_mode
+from modules.config import MODE, DEFAULT_BALANCE, EXCHANGE_NAME
+from modules.exchange_client import ExchangeClient
+from core.id_manager import IdManager
+from storage.db.repository import Repository
+
+OPEN_POSITIONS = {}
+
+MAX_POSITIONS = 500
+RISK_PER_TRADE = 0.01  # 1%
+
+client = ExchangeClient()
+client.connect()
+id_manager = IdManager()
+
+
+def can_open(symbol: str) -> bool:
+    if symbol in OPEN_POSITIONS:
+        return False
+    if len(OPEN_POSITIONS) >= MAX_POSITIONS:
+        return False
+    return True
+
+
+def calculate_position_size(balance: float, price: float) -> float:
+    if price <= 0:
+        return 0.0
+
+    try:
+        from services.test_control import read as tc_read
+        tc = tc_read()
+        fixed_size = float(tc.get("param_size_usdt", 0) or 0)
+        if fixed_size > 0:
+            return round(fixed_size / price, 6)
+    except Exception:
+        pass
+
+    risk_amount = balance * RISK_PER_TRADE
+    size = risk_amount / price
+    return round(size, 6)
+
+
+def build_order(signal: dict, balance: float) -> dict:
+    symbol = signal["symbol"]
+
+    price = float(signal.get("entry_price") or signal.get("entry") or signal.get("price") or 0)
+    if price <= 0:
+        raise ValueError(f"INVALID PRICE for {symbol} -> {price}")
+
+    size = calculate_position_size(balance, price)
+    if size <= 0:
+        raise ValueError(f"INVALID SIZE for {symbol} -> {size}")
+
+    notional = round(price * size, 2)
+
+    direction = str(signal.get("direction", "long")).lower()
+    side = direction.upper()
+
+    sl = float(signal.get("sl") or 0)
+    tp1 = float(signal.get("tp1") or 0)
+    tp2 = float(signal.get("tp2") or 0)
+    tp3 = float(signal.get("tp3") or 0)
+
+    opened_at = datetime.utcnow().isoformat()
+    trade_id = id_manager.next_trade_id()
+
+    try:
+        from services.test_control import read as tc_read
+        tc = tc_read()
+        leverage = int(tc.get("param_leverage", 1) or 1)
+        fixed_size = float(tc.get("param_size_usdt", 0) or 0)
+    except Exception:
+        leverage = 1
+        fixed_size = 0.0
+
+    risk_usdt = round(fixed_size if fixed_size > 0 else notional, 2)
+    risk_pct = round((risk_usdt / balance) * 100, 2) if balance > 0 else 0
+
+    sl_val = float(signal.get("sl") or 0)
+    entry_val = price
+    sl_dist = abs(entry_val - sl_val) if (entry_val and sl_val) else 0
+
+    tp1_val = float(signal.get("tp1") or 0)
+    tp1_dist = abs(tp1_val - entry_val) if (entry_val and tp1_val) else 0
+
+    rr = round(tp1_dist / sl_dist, 2) if sl_dist > 0 else 0
+
+    return {
+        "trade_id": trade_id,
+        "symbol": symbol,
+        "direction": direction,
+        "side": side,
+        "strategy": signal.get("strategy", "APEX_ORB"),
+        "session_name": signal.get("session_name"),
+        "session_hour": signal.get("entry_hour"),
+        "entry": price,
+        "entry_price": price,
+        "fill_price": price,
+        "opened_at": opened_at,
+        "timestamp": opened_at,
+        "size": size,
+        "notional": notional,
+        "size_usdt": notional,
+        "risk_usdt": risk_usdt,
+        "risk_pct": risk_pct,
+        "rr": rr,
+        "leverage": leverage,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "mode": MODE,
+        "exchange_name": EXCHANGE_NAME,
+        "entry_signal_score": signal.get("score"),
+        "scanner_score": signal.get("score"),
+        "session_open_time": signal.get("session_open_time"),
+        "entry_reason_code": signal.get("entry_reason_code"),
+        "entry_reason_text": signal.get("entry_reason_text"),
+        "setup_name": signal.get("setup_name", "APEX_ORB_5M"),
+        "strategy_family": signal.get("strategy_family", "ORB"),
+        "strategy_version": signal.get("strategy_version", "v1"),
+        "setup_variant": signal.get("setup_variant", "A"),
+        "market_type": signal.get("market_type", "FUTURES"),
+        "instrument_type": signal.get("instrument_type", "PERPETUAL"),
+        "calc_version": signal.get("calc_version", "v2.0"),
+    }
+
+
+def execute(signal: dict, balance: float = DEFAULT_BALANCE):
+    symbol = signal["symbol"]
+    print(f"[EXECUTION TRY] {symbol}")
+
+    if get_mode() != "RUN":
+        print(f"[BLOCKED] {symbol} (mode={get_mode()})")
+        return None
+
+    if not can_open(symbol):
+        print(f"[BLOCKED] {symbol} (already open or max positions)")
+        return None
+
+    if not can_trade(len(OPEN_POSITIONS)):
+        print(f"[BLOCKED] {symbol} (risk manager)")
+        return None
+
+    # Safety check for LIVE
+    if MODE == "LIVE":
+        state = get_state()
+        if state["blocked"]:
+            print(f"[BLOCKED] {symbol} (risk blocked)")
+            return None
+        if balance <= 0:
+            print(f"[BLOCKED] {symbol} (no balance)")
+            return None
+
+    order = build_order(signal, balance)
+
+    # Запись в БД при успешном открытии
+    def _persist_order(order_data):
+        try:
+            repo = Repository()
+            repo.log_execution(order_data)
+        except Exception as e:
+            print(f"[DB ERROR] {order_data.get('symbol')}: {e}")
+
+    # SIMULATION
+    if MODE == "SIMULATION":
+        OPEN_POSITIONS[symbol] = order
+        add_position(order)
+        _persist_order(order)
+        print(f"[OPENED] {symbol} [SIM]")
+
+        try:
+            import asyncio
+            notifier = get_notifier()
+            if notifier:
+                asyncio.ensure_future(notifier.notify_open(order))
+        except Exception:
+            pass
+
+        return order
+
+    # PAPER
+    if MODE == "PAPER":
+        OPEN_POSITIONS[symbol] = order
+        add_position(order)
+        _persist_order(order)
+        print(f"[OPENED] {symbol} [PAPER]")
+
+        try:
+            import asyncio
+            notifier = get_notifier()
+            if notifier:
+                asyncio.ensure_future(notifier.notify_open(order))
+        except Exception:
+            pass
+
+        return order
+
+    # LIVE
+    if MODE == "LIVE":
+        success = client.place_order(
+            symbol,
+            order["side"],
+            order["size"]
+        )
+
+        if success:
+            OPEN_POSITIONS[symbol] = order
+            add_position(order)
+            _persist_order(order)
+            print(f"[OPENED] {symbol} [LIVE]")
+
+            try:
+                import asyncio
+                notifier = get_notifier()
+                if notifier:
+                    asyncio.ensure_future(notifier.notify_open(order))
+            except Exception:
+                pass
+
+            return order
+
+        print(f"[BLOCKED] {symbol} (live order failed)")
+        return None
+
+    print(f"[BLOCKED] {symbol} (unknown mode={MODE})")
+    return None

@@ -1,0 +1,15 @@
+{
+  "strategy_name": "TOP20_1M_BREAKOUT_v1",
+  "strategy_folder": "TEST_STRATEGY_01",
+  "db_table": "APEX_MASTER_TRADE",
+  "version": "1.0",
+  "status": "ACTIVE",
+  "run_mode": "manual",
+  "timeframe": "1m",
+  "universe": "TOP20",
+  "direction": "both",
+  "session_bind": false,
+  "auto_complete": true,
+  "carry_over_limits": false,
+  "track_run_id": true
+}

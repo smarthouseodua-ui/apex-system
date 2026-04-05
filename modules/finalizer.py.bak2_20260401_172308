@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+APEX PROTOCOL™ — Finalizer
+Закрытие сделок и полный расчёт PnL блока.
+"""
+import sys
+import json
+import sqlite3
+import urllib.request
+import urllib.parse
+from datetime import datetime, timezone
+
+sys.path.insert(0, '/root/apex-system')
+
+from storage.db.repository import Repository
+
+DB_PATH = "/root/apex-system/storage/db/sqlite/apex.db"
+
+def connect_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def to_bybit_symbol(symbol: str) -> str:
+    return symbol.replace("/", "").replace(":USDT", "")
+
+def get_price(symbol: str) -> float:
+    bybit_symbol = to_bybit_symbol(symbol)
+    url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={bybit_symbol}"
+    with urllib.request.urlopen(url, timeout=10) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return float(data["result"]["list"][0]["lastPrice"])
+
+def get_open_positions(conn):
+    return conn.execute("""
+        SELECT trade_id, symbol, direction, entry, fill_price,
+               sl, tp1, tp2, tp3, size, risk_usdt, rr,
+               opened_at, commission, session_name
+        FROM APEX_MASTER_TRADE
+        WHERE row_status IN ('active', 'open')
+        AND closed_at IS NULL
+    """).fetchall()
+
+def calc_pnl(direction, entry, close_price, size):
+    if direction.upper() == "LONG":
+        return round((close_price - entry) * size, 6)
+    else:
+        return round((entry - close_price) * size, 6)
+
+def calc_minutes(opened_at_str, closed_at):
+    try:
+        opened_at_str = str(opened_at_str).replace("Z", "")
+        if "+" in opened_at_str:
+            opened_at_str = opened_at_str.split("+")[0]
+        if "." in opened_at_str:
+            opened_at_str = opened_at_str.split(".")[0]
+        opened_at = datetime.strptime(opened_at_str, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        result = int((closed_at - opened_at).total_seconds() / 60)
+        return max(result, 0)
+    except Exception as e:
+        print(f"CALC_MINUTES_ERROR: {e} | {opened_at_str}")
+        return None
+
+def close_trade(conn, trade, price, reason):
+    trade_id    = trade["trade_id"]
+    symbol      = trade["symbol"]
+    direction   = trade["direction"]
+    entry       = float(trade["entry"] or trade["fill_price"] or 0)
+    size        = float(trade["size"] or 0)
+    risk_usdt   = float(trade["risk_usdt"] or 0)
+    rr_plan     = float(trade["rr"] or 0)
+    opened_at   = trade["opened_at"]
+    commission  = float(trade["commission"] or 0.03)
+    tp1         = float(trade["tp1"] or 0)
+    tp2         = float(trade["tp2"] or 0)
+    sl          = float(trade["sl"] or 0)
+
+    closed_at   = datetime.now(timezone.utc)
+    finalized_at = closed_at.isoformat()
+    closed_at_str = closed_at.isoformat()
+
+    # Время
+    minutes_to_close = calc_minutes(opened_at, closed_at)
+
+    # Определяем tp_level_reached_max и close_trigger_side
+    if reason == "TP2":
+        tp_level_reached_max = 2
+    elif reason == "TP1":
+        tp_level_reached_max = 1
+    else:
+        tp_level_reached_max = 0
+
+    close_trigger_side = "LONG" if direction.upper() == "LONG" else "SHORT"
+
+    # PnL расчёт
+    gross_pnl_usdt = calc_pnl(direction, entry, price, size)
+
+    fee_rate = commission / 100.0
+    fees_open_usdt  = abs(entry * size) * fee_rate
+    fees_close_usdt = abs(price * size) * fee_rate
+    total_fees_usdt = fees_open_usdt + fees_close_usdt
+    net_pnl_usdt    = round(gross_pnl_usdt - total_fees_usdt, 6)
+
+    notional = abs(entry * size)
+    gross_pnl_pct = round((gross_pnl_usdt / notional) * 100, 4) if notional > 0 else None
+    net_pnl_pct   = round((net_pnl_usdt / notional) * 100, 4)   if notional > 0 else None
+    pnl_pct       = net_pnl_pct
+
+    # actual_rr и r_multiple
+    sl_dist = abs(entry - sl) if sl else 0
+    actual_dist = abs(price - entry)
+    actual_rr = round(actual_dist / sl_dist, 4) if sl_dist > 0 else None
+    r_multiple = actual_rr
+
+    # actual_loss_usdt — только если SL
+    actual_loss_usdt = abs(net_pnl_usdt) if reason == "SL" else None
+
+    # minutes_to_tp1 и minutes_to_sl — теоретические (сколько прошло до цели)
+    minutes_to_tp1 = minutes_to_close if reason in ("TP1", "TP2", "TP3") else None
+    minutes_to_sl  = minutes_to_close if reason == "SL" else None
+
+    # exit codes
+    exit_reason_code = reason
+    exit_reason_text = {
+        "SL":      "Stop Loss triggered",
+        "TP1":     "Take Profit 1 reached",
+        "TP2":     "Take Profit 2 reached",
+        "TP3":     "Take Profit 3 reached",
+        "TIMEOUT": "Position timeout",
+        "MANUAL":  "Manual close",
+    }.get(reason, reason)
+
+    # MFE/MAE approximation — по цене закрытия
+    if direction.upper() == "LONG":
+        mfe = round(max(price - entry, 0) / entry * 100, 4)
+        mae = round(max(entry - price, 0) / entry * 100, 4)
+    else:
+        mfe = round(max(entry - price, 0) / entry * 100, 4)
+        mae = round(max(price - entry, 0) / entry * 100, 4)
+
+    result = {
+        "trade_id":             trade_id,
+        "symbol":               symbol,
+        "direction":            direction,
+        "session_name":         trade["session_name"],
+        "close_price":          price,
+        "close_reason":         reason,
+        "exit_reason_code":     exit_reason_code,
+        "exit_reason_text":     exit_reason_text,
+        "close_trigger_side":   close_trigger_side,
+        "max_favorable_excursion_mfe": mfe,
+        "max_adverse_excursion_mae":   mae,
+        "tp_level_reached_max": tp_level_reached_max,
+        "closed_at":            closed_at_str,
+        "finalized_at":         finalized_at,
+        "minutes_to_close":     minutes_to_close,
+        "minutes_to_tp1":       minutes_to_tp1,
+        "minutes_to_sl":        minutes_to_sl,
+        "duration_minutes":     minutes_to_close,
+        "gross_pnl_usdt":       gross_pnl_usdt,
+        "net_pnl_usdt":         net_pnl_usdt,
+        "gross_pnl_pct":        gross_pnl_pct,
+        "net_pnl_pct":          net_pnl_pct,
+        "pnl_pct":              pnl_pct,
+        "pnl_usdt":             net_pnl_usdt,
+        "actual_loss_usdt":     actual_loss_usdt,
+        "actual_rr":            actual_rr,
+        "r_multiple":           r_multiple,
+        "fees_open_usdt":       fees_open_usdt,
+        "fees_close_usdt":      fees_close_usdt,
+        "total_fees_usdt":      total_fees_usdt,
+        "entry":                entry,
+        "fill_price":           entry,
+        "size":                 size,
+        "commission":           commission,
+    }
+
+    repo = Repository()
+    repo.log_final_trade(result)
+
+    # Уведомление в Telegram
+    try:
+        from services.telegram_notifier import get_notifier
+        import asyncio
+        notifier = get_notifier()
+        if notifier:
+            result["opened_at"] = trade["opened_at"]
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(notifier.notify_close(result))
+                else:
+                    loop.run_until_complete(notifier.notify_close(result))
+            except Exception:
+                asyncio.run(notifier.notify_close(result))
+    except Exception as e:
+        print(f"NOTIFY_ERROR: {e}")
+        try:
+            import traceback as _tb
+            from storage.db.repository import Repository as _Repo
+            _Repo().log_system_event(event="NOTIFY_ERROR", module="finalizer",
+                message=str(e), level="WARNING", traceback=_tb.format_exc())
+        except Exception:
+            pass
+
+    print(f"CLOSED {symbol} {reason} price={price} pnl={round(net_pnl_usdt,2)} min={minutes_to_close}")
+
+def main():
+    conn = connect_db()
+    trades = get_open_positions(conn)
+    print(f"OPEN_TRADES={len(trades)}")
+
+    for trade in trades:
+        try:
+            price = get_price(trade["symbol"])
+        except Exception as e:
+            print(f"PRICE_ERROR {trade['symbol']}: {e}")
+            try:
+                import traceback as _tb
+                from storage.db.repository import Repository as _Repo
+                _Repo().log_system_event(event="PRICE_FETCH_ERROR", module="finalizer",
+                    message=f"{trade.get('symbol')}: {e}", level="ERROR", traceback=_tb.format_exc())
+            except Exception:
+                pass
+            continue
+
+        direction = trade["direction"].upper()
+        sl  = float(trade["sl"]  or 0)
+        tp1 = float(trade["tp1"] or 0)
+        tp2 = float(trade["tp2"] or 0)
+
+        reason = None
+        if direction == "LONG":
+            if sl > 0 and price <= sl:
+                reason = "SL"
+            elif tp2 > 0 and price >= tp2:
+                reason = "TP2"
+            elif tp1 > 0 and price >= tp1:
+                reason = "TP1"
+        elif direction == "SHORT":
+            if sl > 0 and price >= sl:
+                reason = "SL"
+            elif tp2 > 0 and price <= tp2:
+                reason = "TP2"
+            elif tp1 > 0 and price <= tp1:
+                reason = "TP1"
+
+        if reason:
+            close_trade(conn, trade, price, reason)
+
+    print("FINALIZER_DONE")
+
+if __name__ == "__main__":
+    main()
+
+
+# ─────────────────────────────────────────────
+# Класс-обёртка для orchestrator
+# ─────────────────────────────────────────────
+class Finalizer:
+    def __init__(self, config: dict, event_bus=None):
+        self.config = config
+        self.event_bus = event_bus
+
+    async def finalize(self, open_positions: list):
+        """Вызывается orchestrator — финализирует открытые позиции."""
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        trades = get_open_positions(conn)
+        for trade in trades:
+            try:
+                price = get_price(trade["symbol"])
+            except Exception as e:
+                print(f"PRICE_ERROR {trade['symbol']}: {e}")
+                continue
+            direction = trade["direction"].upper()
+            sl  = float(trade["sl"]  or 0)
+            tp1 = float(trade["tp1"] or 0)
+            tp2 = float(trade["tp2"] or 0)
+            reason = None
+            if direction == "LONG":
+                if sl > 0 and price <= sl:
+                    reason = "SL"
+                elif tp2 > 0 and price >= tp2:
+                    reason = "TP2"
+                elif tp1 > 0 and price >= tp1:
+                    reason = "TP1"
+            elif direction == "SHORT":
+                if sl > 0 and price >= sl:
+                    reason = "SL"
+                elif tp2 > 0 and price <= tp2:
+                    reason = "TP2"
+                elif tp1 > 0 and price <= tp1:
+                    reason = "TP1"
+            if reason:
+                close_trade(conn, trade, price, reason)
+        conn.close()

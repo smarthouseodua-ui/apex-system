@@ -1,11 +1,8 @@
 # exchange_client.py
-
 import os
 import ccxt
 
-
 class ExchangeClient:
-
     def __init__(self):
         self.exchange = None
 
@@ -15,10 +12,47 @@ class ExchangeClient:
             "secret": os.getenv("BYBIT_API_SECRET"),
             "enableRateLimit": True,
         })
+        try:
+            self.exchange.load_markets()
+            print("[ExchangeClient] markets loaded OK")
+        except Exception as e:
+            print(f"[ExchangeClient] load_markets failed: {e}")
 
     def get_balance(self):
-        balance = self.exchange.fetch_balance()
-        return balance.get("USDT", {}).get("free", 0)
+        try:
+            balance = self.exchange.fetch_balance()
+            return balance.get("USDT", {}).get("free", 0)
+        except Exception:
+            return 0
+
+    def get_balance_bybit(self) -> float:
+        """Получить свободный баланс USDT с Bybit."""
+        try:
+            ex = ccxt.bybit({
+                "apiKey": os.getenv("BYBIT_API_KEY"),
+                "secret": os.getenv("BYBIT_API_SECRET"),
+                "enableRateLimit": True,
+            })
+            balance = ex.fetch_balance()
+            return float(balance.get("USDT", {}).get("free", 0))
+        except Exception as e:
+            print(f"[ExchangeClient] Bybit balance error: {e}")
+            return 0.0
+
+    def get_balance_binance(self) -> float:
+        """Получить свободный баланс USDT с Binance Futures."""
+        try:
+            ex = ccxt.binance({
+                "apiKey": os.getenv("BINANCE_API_KEY"),
+                "secret": os.getenv("BINANCE_API_SECRET"),
+                "enableRateLimit": True,
+                "options": {"defaultType": "future"},
+            })
+            balance = ex.fetch_balance()
+            return float(balance.get("USDT", {}).get("free", 0))
+        except Exception as e:
+            print(f"[ExchangeClient] Binance balance error: {e}")
+            return 0.0
 
     def place_order(self, symbol, side, size):
         try:

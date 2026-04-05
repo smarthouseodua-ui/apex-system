@@ -1,49 +1,48 @@
-# APEX PROTOCOL™ — Risk Config
 risk:
-  # Баланс
-  balance_usdt: 5000
-  # Размер позиции — фиксированный
-  fixed_size_usdt: 1200
-  # Резервный режим (если fixed_size_usdt не задан)
+  allowed_sessions:
+  - HONG_KONG
+  - LONDON
+  - NEW_YORK
+  - ASIA
+  - TEST_1
+  - TEST_2
+  - TEST_3
+  - Tokyo
+  balance_usdt: 50000
+  blocked_hours:
+  - 13
+  fixed_size_usdt: 500
+  leverage: 20
+  max_daily_loss_pct: 999.0
+  max_drawdown_pct: 999.0
+  max_positions: 856
+  max_trade_minutes: 90
   risk_per_trade_pct: 0.1
-  # SL / TP по процентам от entry
-  sl_pct:  1.0
-  tp1_pct: 1.5
-  tp2_pct: 2.5
-  tp3_pct: 3.5
-  # Прочие параметры
-  max_trade_minutes:  90
-  max_daily_loss_pct: 5.0
-  max_drawdown_pct:   15.0
-  leverage:           30
-  rr_ratio:           2.0
-  max_positions:      50
-  # TP распределение (% от позиции)
-  tp1_close_pct: 50
-  tp2_close_pct: 30
-  tp3_close_pct: 20
-  # Trailing SL
-  trailing_sl_enabled:    false
-  trailing_sl_activation: 1.0
-  trailing_sl_step:       0.5
-  # Сессионные ограничения
-  blocked_hours: [13]
-  allowed_sessions: ["HONG_KONG", "LONDON", "NEW_YORK", "ASIA", "TEST_1", "TEST_2", "TEST_3", "Tokyo"]
-  # Сессионные фильтры (направление)
+  rr_ratio: 2.0
   session_filters:
-    HONG_KONG:
-      direction: "both"
-    NEW_YORK:
-      direction: "both"
-    LONDON:
-      direction: "both"
     ASIA:
-      direction: "both"
+      direction: both
+    HONG_KONG:
+      direction: both
+    LONDON:
+      direction: both
+    NEW_YORK:
+      direction: both
     TEST_1:
-      direction: "both"
+      direction: both
     TEST_2:
-      direction: "both"
+      direction: both
     TEST_3:
-      direction: "both"
+      direction: both
     Tokyo:
-      direction: "both"
+      direction: both
+  sl_pct: 1.0
+  tp1_close_pct: 50
+  tp1_pct: 1.5
+  tp2_close_pct: 30
+  tp2_pct: 2.5
+  tp3_close_pct: 20
+  tp3_pct: 3.5
+  trailing_sl_activation: 1.0
+  trailing_sl_enabled: false
+  trailing_sl_step: 0.5

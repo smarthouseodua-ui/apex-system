@@ -1,0 +1,447 @@
+# engine_telegram_bot.py
+# APEX ENGINE — отдельный Telegram-бот
+# Не связан со старым Telegram-контуром
+
+import os
+import sys
+from datetime import datetime
+
+sys.path.insert(0, "/root/apex-system")
+
+from dotenv import load_dotenv
+load_dotenv("/root/apex-system/.env")
+
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, BotCommand
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+
+from modules.telegram_control import set_mode, get_mode
+from modules.config import MODE, DEFAULT_BALANCE, EXCHANGE_NAME, MARKET_TYPE
+from modules.risk_manager import get_state as get_risk_state
+from modules.analytics_engine import compute_stats, load_results
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ALLOWED_USER_ID = int(os.getenv("TELEGRAM_USER_ID", "0"))
+
+
+# --- Sessions (UTC) ---
+
+SESSIONS = [
+    {"name": "АЗИЯ",     "flag": "🇯🇵", "start": 0,    "end": 90},
+    {"name": "ГОНКОНГ",  "flag": "🇭🇰", "start": 90,   "end": 480},
+    {"name": "ЕВРОПА",   "flag": "🇪🇺", "start": 480,  "end": 870},
+    {"name": "США",      "flag": "🇺🇸", "start": 870,  "end": 1440},
+]
+
+ENTRY_WINDOW_MIN = 180
+
+
+def _get_session_info():
+    now = datetime.utcnow()
+    total_min = now.hour * 60 + now.minute
+
+    for s in SESSIONS:
+        if s["start"] <= total_min < s["end"]:
+            elapsed = total_min - s["start"]
+            if elapsed < ENTRY_WINDOW_MIN:
+                status = "🟢 АКТИВНАЯ"
+                remaining = ENTRY_WINDOW_MIN - elapsed
+                entry_str = f"{remaining} мин"
+            else:
+                status = "🔵 ВНЕ ВХОДА"
+                entry_str = "окно закрыто"
+            return {
+                "name": s["name"],
+                "flag": s["flag"],
+                "status": status,
+                "entry": entry_str,
+                "time": now.strftime("%H:%M UTC"),
+            }
+
+    return {
+        "name": "НЕТ",
+        "flag": "⚫",
+        "status": "🔴 ЗАКРЫТА",
+        "entry": "—",
+        "time": datetime.utcnow().strftime("%H:%M UTC"),
+    }
+
+
+def _get_scanner_state():
+    from modules.runtime_state import get_scanner_state
+    return get_scanner_state()
+
+
+# --- Keyboards ---
+
+def get_main_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📊 Статус"),    KeyboardButton("⚡ ВАУ+")],
+            [KeyboardButton("🟢 Старт"),     KeyboardButton("🔴 Стоп")],
+            [KeyboardButton("📍 Позиции"),    KeyboardButton("♻️ Сброс")],
+            [KeyboardButton("⚙️ Настройка бота")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True
+    )
+
+
+# --- Auth ---
+
+def is_allowed(user_id):
+    return user_id == ALLOWED_USER_ID
+
+
+# --- Data helpers ---
+
+def _get_open_positions():
+    from modules.position_monitor import OPEN_POSITIONS
+    return OPEN_POSITIONS
+
+
+def _get_ee_config():
+    from modules.execution_engine import MAX_POSITIONS, RISK_PER_TRADE
+    return MAX_POSITIONS, RISK_PER_TRADE
+
+
+def _minutes_ago(dt):
+    if not dt:
+        return "—"
+    if isinstance(dt, str):
+        return dt
+    delta = datetime.utcnow() - dt
+    mins = int(delta.total_seconds() / 60)
+    if mins < 1:
+        return "только что"
+    if mins < 60:
+        return f"{mins} мин назад"
+    hours = mins // 60
+    return f"{hours}ч {mins % 60}мин назад"
+
+
+def _time_to_exit(dt):
+    from modules.position_monitor import TIME_LIMIT_MIN
+    if not dt or isinstance(dt, str):
+        return "—"
+    elapsed = (datetime.utcnow() - dt).total_seconds() / 60
+    remaining = TIME_LIMIT_MIN - elapsed
+    if remaining <= 0:
+        return "сейчас"
+    return f"{int(remaining)} мин"
+
+
+# --- Formatters ---
+
+def _format_status():
+    risk = get_risk_state()
+    positions = _get_open_positions()
+    max_pos, risk_pct = _get_ee_config()
+    open_count = sum(1 for p in positions.values() if p.get("status") == "open")
+    sess = _get_session_info()
+    sc = _get_scanner_state()
+
+    streak_val = risk["loss_streak"]
+    blocked_str = "🔴 ДА" if risk["blocked"] else "🟢 НЕТ"
+
+    msg = (
+        f"⚡ APEX ENGINE\n\n"
+        f"🕒 {sess['time']}\n"
+        f"БИРЖА: {EXCHANGE_NAME}\n"
+        f"РЫНОК: {MARKET_TYPE}\n"
+        f"РЕЖИМ: {MODE} | {get_mode()}\n\n"
+        f"СЕССИЯ: {sess['flag']} {sess['name']}\n"
+        f"СТАТУС: {sess['status']}\n"
+        f"ОКНО ВХОДА: {sess['entry']}\n\n"
+        f"📡 РЫНОК:\n"
+        f"  ПАР В СКАНЕ: {sc['total_pairs']}\n"
+        f"  ПОСЛЕ ФИЛЬТРА: {sc['after_structure']}\n"
+        f"  КАНДИДАТЫ: {sc['candidates']}\n"
+        f"  СИГНАЛЫ: {sc['signals']}\n"
+        f"  Top score: {sc['top_score']}\n\n"
+    )
+
+    if sc.get("signals", 0) == 0:
+        from modules.runtime_state import get_debug_state
+        dbg = get_debug_state()
+        reason = dbg.get("last_reject_reason", "неизвестно")
+
+        msg += "🚫 ВХОДОВ НЕТ\n\n"
+        msg += (
+            f"ЭТАПЫ:\n"
+            f"  {dbg.get('stage_pairs', 0)} пар"
+            f" → {dbg.get('stage_liquidity', 0)} ликвид."
+            f" → {dbg.get('stage_volatility', 0)} волат."
+            f" → {dbg.get('stage_structure', 0)} структ."
+            f" → {dbg.get('stage_ema_filter', 0)} EMA"
+            f" → {dbg.get('stage_sent_to_filter', 0)} кандид."
+            f" → {dbg.get('stage_final', 0)} сигн.\n\n"
+            f"ПРИЧИНА: {reason}\n\n"
+        )
+
+    msg += (
+        f"💼 ПОЗИЦИИ: {open_count} / {max_pos}\n\n"
+        f"💰 БАЛАНС: {DEFAULT_BALANCE} USDT\n"
+        f"РИСК НА СДЕЛКУ: {risk_pct * 100}%\n\n"
+        f"⚠️ РИСК:\n"
+        f"  БЛОК: {blocked_str}\n"
+        f"  PnL ДЕНЬ: {round(risk['daily_pnl'], 2)} USDT\n"
+        f"  PnL ОБЩИЙ: {round(risk['total_pnl'], 2)} USDT\n"
+        f"  СЕРИЯ: {streak_val}"
+    )
+
+    return msg
+
+
+def _format_vau():
+    risk = get_risk_state()
+    positions = _get_open_positions()
+    open_pos = {s: p for s, p in positions.items() if p.get("status") == "open"}
+    open_count = len(open_pos)
+    sess = _get_session_info()
+    sc = _get_scanner_state()
+
+    blocked_str = "🔴 БЛОК" if risk["blocked"] else "🟢 OK"
+
+    results = load_results()
+    stats = compute_stats(results)
+
+    if stats:
+        analytics_line = (
+            f"Сделок: {stats['total_trades']} | "
+            f"WR: {stats['winrate']}% | "
+            f"PF: {stats['profit_factor']}"
+        )
+    else:
+        analytics_line = "Сделок пока нет"
+
+    last_line = "Нет недавних входов"
+    if open_pos:
+        last_sym = list(open_pos.keys())[-1]
+        last = open_pos[last_sym]
+        last_line = (
+            f"ПОСЛЕДНИЙ ВХОД:\n"
+            f"  {last_sym} {last.get('side', '?')}\n"
+            f"  ВХОД: {last.get('entry_price')}\n"
+            f"  SL: {last.get('sl', '—')}\n"
+            f"  TP1: {last.get('tp1', '—')}"
+        )
+
+    # Entry reason for VAU
+    entry_reason = ""
+    if sc.get("signals", 0) == 0:
+        from modules.runtime_state import get_debug_state
+        dbg = get_debug_state()
+        reason = dbg.get("last_reject_reason", "")
+        if reason:
+            entry_reason = f"Нет входа\nПричина: {reason}\n\n"
+        else:
+            entry_reason = f"Нет входа (score {sc['top_score']})\n\n"
+
+    msg = (
+        f"⚡ БЫСТРЫЙ СТАТУС\n\n"
+        f"{EXCHANGE_NAME} | {MARKET_TYPE}\n"
+        f"{sess['flag']} {sess['name']}\n\n"
+        f"РЫНОК:\n"
+        f"  {sc['total_pairs']} → {sc['after_structure']} → {sc['candidates']} → {open_count} открыто\n\n"
+        f"{entry_reason}"
+    )
+
+    if sc.get("signals", 0) > 0 and open_count == 0:
+        msg += "⚠️ СИГНАЛ ЕСТЬ, НО ВХОДА НЕТ\n\n"
+
+    msg += (
+        f"ПОЗИЦИИ: {open_count}\n\n"
+        f"{analytics_line}\n\n"
+        f"{last_line}\n\n"
+        f"РИСК: {blocked_str}"
+    )
+
+    return msg
+
+
+def _format_positions():
+    pos_dict = _get_open_positions()
+    open_pos = {s: p for s, p in pos_dict.items() if p.get("status") == "open"}
+    sc = _get_scanner_state()
+
+    if not open_pos:
+        return f"Нет открытых позиций\n(Сигналов сейчас: {sc['signals']})"
+
+    lines = []
+    for symbol, p in open_pos.items():
+        entry = p.get("entry_price", 0)
+        side = p.get("side", "?")
+        current = p.get("current_price", entry)
+        size = p.get("size", 0)
+        notional = p.get("notional", round(entry * size, 2) if entry and size else 0)
+        sl = p.get("sl", "—")
+        tp1 = p.get("tp1", "—")
+        tp2 = p.get("tp2", "—")
+        tp3 = p.get("tp3", "—")
+        mode = p.get("mode", MODE)
+        opened_at = p.get("opened_at")
+
+        if entry and entry > 0 and current:
+            if side == "LONG":
+                pnl_pct = round((current - entry) / entry * 100, 2)
+            else:
+                pnl_pct = round((entry - current) / entry * 100, 2)
+            pnl_sign = "+" if pnl_pct >= 0 else ""
+        else:
+            pnl_pct = 0
+            pnl_sign = ""
+
+        lines.append(
+            f"📍 {symbol}\n\n"
+            f"БИРЖА: {EXCHANGE_NAME}\n"
+            f"РЫНОК: {MARKET_TYPE}\n"
+            f"СТОРОНА: {side}\n"
+            f"ТИП: {mode}\n"
+            f"ВХОД: {entry}\n"
+            f"СЕЙЧАС: {current}\n"
+            f"РАЗМЕР: {size}\n"
+            f"НОМИНАЛ: {notional} USDT\n\n"
+            f"SL: {sl}\n"
+            f"TP1: {tp1}\n"
+            f"TP2: {tp2}\n"
+            f"TP3: {tp3}\n\n"
+            f"PnL: {pnl_sign}{pnl_pct}%\n\n"
+            f"ОТКРЫТА: {_minutes_ago(opened_at)}\n"
+            f"TIME EXIT: через {_time_to_exit(opened_at)}"
+        )
+
+    return "\n\n———————————\n\n".join(lines)
+
+
+def _format_analytics():
+    results = load_results()
+    stats = compute_stats(results)
+
+    if not stats:
+        return "Нет данных аналитики"
+
+    reasons_str = "\n".join(f"  {k}: {v}" for k, v in stats["reasons"].items())
+
+    return (
+        f"📊 АНАЛИТИКА\n\n"
+        f"Сделок: {stats['total_trades']}\n"
+        f"Побед: {stats['wins']} | Убытков: {stats['losses']}\n"
+        f"Winrate: {stats['winrate']}%\n\n"
+        f"Общий PnL: {stats['total_pnl']}\n"
+        f"Средний PnL: {stats['avg_pnl']}\n"
+        f"Profit Factor: {stats['profit_factor']}\n\n"
+        f"Причины закрытия:\n{reasons_str}"
+    )
+
+
+# --- Command handlers ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text("⚡ APEX ENGINE BOT READY", reply_markup=get_main_keyboard())
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text(_format_status())
+
+
+async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text(_format_positions())
+
+
+async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    await update.message.reply_text(_format_analytics())
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    set_mode("STOP")
+    await update.message.reply_text("⛔ Система остановлена")
+
+
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    set_mode("RUN")
+    await update.message.reply_text("✅ Система запущена")
+
+
+# --- Button handler ---
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+
+    text = update.message.text.strip()
+
+    if text == "📊 Статус":
+        await update.message.reply_text(_format_status())
+
+    elif text == "⚡ ВАУ+":
+        await update.message.reply_text(_format_vau())
+
+    elif text == "🟢 Старт":
+        set_mode("RUN")
+        await update.message.reply_text("✅ Система запущена")
+
+    elif text == "🔴 Стоп":
+        set_mode("STOP")
+        await update.message.reply_text("⛔ Система остановлена")
+
+    elif text == "📍 Позиции":
+        await update.message.reply_text(_format_positions())
+
+    elif text == "♻️ Сброс":
+        from modules.risk_manager import reset_full
+        reset_full()
+        await update.message.reply_text(
+            "♻️ Сброс выполнен\n\n"
+            "PnL за день: 0.0\n"
+            "PnL общий: 0.0\n"
+            "Серия убытков: 0\n"
+            "Блок: снят"
+        )
+
+    elif text == "⚙️ Настройка бота":
+        await update.message.reply_text("⚙️ Настройка бота будет добавлена следующим этапом")
+
+
+# --- Setup commands menu ---
+
+async def post_init(application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Запуск бота"),
+        BotCommand("status", "Статус системы"),
+        BotCommand("positions", "Открытые позиции"),
+        BotCommand("analytics", "Аналитика сделок"),
+        BotCommand("stop", "Остановить торговлю"),
+        BotCommand("run", "Запустить торговлю"),
+    ])
+
+
+def run_bot():
+    app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("analytics", cmd_analytics))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button))
+
+    print(f"[ENGINE BOT] Starting with user_id={ALLOWED_USER_ID}")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    run_bot()

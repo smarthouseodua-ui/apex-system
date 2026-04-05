@@ -22,9 +22,6 @@ _SESSION_WINDOWS = {
     "session_london":    (8 * 60,        10 * 60),        # 08:00–10:00  Лондон
     "session_new_york":  (14 * 60 + 30,  16 * 60 + 30),  # 14:30–16:30  Нью-Йорк
     # ── ТЕСТ-БЛОК ──────────────────────────────────────────────────────
-    "session_test1":     (11 * 60 + 30,  13 * 60 + 30),  # 11:30–13:30  Тест 1
-    "session_test2":     (17 * 60,       19 * 60),        # 17:00–19:00  Тест 2
-    "session_test3":     (6  * 60,       8  * 60),        # 06:00–08:00  Тест 3
     # ── КОНЕЦ ТЕСТ-БЛОКА ────────────────────────────────────────────────
 }
 
@@ -33,9 +30,6 @@ _SESSION_LABELS = {
     "session_hong_kong": "HONG_KONG",
     "session_london":    "LONDON",
     "session_new_york":  "NEW_YORK",
-    "session_test1":     "TEST_1",
-    "session_test2":     "TEST_2",
-    "session_test3":     "TEST_3",
 }
 
 # Маппинг label → ключ _SESSION_WINDOWS
@@ -166,28 +160,50 @@ def time_features_for_dt(value) -> dict:
     }
     try:
         if isinstance(value, str):
-            dt = datetime.fromisoformat(value.replace("Z", ""))
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
         elif isinstance(value, datetime):
             dt = value
         else:
             return _empty
 
-        # opened_at уже в Europe/Podgorica — берём час и минуту напрямую
-        total_minutes = dt.hour * 60 + dt.minute
+        # UTC эталон для аналитической классификации сессии
+        from zoneinfo import ZoneInfo
+        if dt.tzinfo is not None:
+            dt_utc = dt.astimezone(ZoneInfo("UTC"))
+        else:
+            dt_utc = dt
+        utc_min = dt_utc.hour * 60 + dt_utc.minute
+
+        # UTC окна сессий — эталон
+        _UTC_SESSIONS = {
+            "ASIA":      (0 * 60,  8 * 60),   # 00:00-08:00 UTC
+            "LONDON":    (8 * 60,  13 * 60),  # 08:00-13:00 UTC
+            "NEW_YORK":  (13 * 60, 21 * 60),  # 13:00-21:00 UTC
+        }
 
         result = {}
 
-        # --- session flags ---
+        # --- session flags по UTC ---
         active_sessions = []
-        for key, (start, end) in _SESSION_WINDOWS.items():
-            flag = 1 if start <= total_minutes < end else 0
+        for label, (start, end) in _UTC_SESSIONS.items():
+            flag = 1 if start <= utc_min < end else 0
+            key = "session_" + label.lower()
             result[key] = flag
             if flag:
-                active_sessions.append(_SESSION_LABELS[key])
+                active_sessions.append(label)
 
-        # --- event flags ---
-        for key, (start, end) in _EVENT_WINDOWS.items():
-            result[key] = 1 if start <= total_minutes < end else 0
+        # Совместимость
+        result.setdefault("session_hong_kong", 0)
+
+        # --- overlap флаги по UTC ---
+        result["event_overlap_london_ny"] = 1 if (13*60 <= utc_min < 16*60) else 0
+        result["event_overlap_asia_hk"]   = 1 if (2*60  <= utc_min < 4*60)  else 0
+
+        # --- event флаги (оставляем пустыми для совместимости) ---
+        result.setdefault("event_tokyo_open", 0)
+        result.setdefault("event_hk_open", 0)
+        result.setdefault("event_london_open", 0)
+        result.setdefault("event_ny_open", 0)
 
         result["session_name"] = ",".join(active_sessions) if active_sessions else "OFF"
 

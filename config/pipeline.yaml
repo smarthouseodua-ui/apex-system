@@ -1,35 +1,29 @@
-# APEX PROTOCOL™ — Pipeline Config
-
 pipeline:
-  # Режим запуска
-  mode: "simulation"          # simulation / live
-
-  # Цикл
-  cycle_interval: 60          # секунд между циклами
-  max_cycles: 0               # 0 = бесконечно
-
-  # Модули (можно отключать)
+  cycle_interval: 300
+  max_cycles: 0
+  mode: simulation
   modules:
-    scanner: true
-    strategy_engine: true
-    signal_gate: true
-    risk_manager: true
     execution_engine: true
-    position_manager: true
     finalizer: true
-
-  # Стратегии
+    position_manager: true
+    risk_manager: true
+    scanner: true
+    signal_gate: true
+    strategy_engine: true
+  notifications:
+    on_error: true
+    on_trade_close: true
+    on_trade_open: true
+    telegram: false
   strategies:
     orb:
       enabled: true
-      timeframes: ["1m", "15m"]
+      timeframes:
+      - 1m
+      - 15m
     smc:
-      enabled: false          # Этап 2
-      timeframes: ["15m", "1h", "4h"]
-
-  # Уведомления
-  notifications:
-    telegram: false           # включить после настройки
-    on_trade_open: true
-    on_trade_close: true
-    on_error: true
+      enabled: true
+      timeframes:
+      - 15m
+      - 1h
+      - 4h

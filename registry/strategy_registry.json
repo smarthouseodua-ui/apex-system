@@ -1,0 +1,9 @@
+{
+  "strategies": [
+    {
+      "name": "TEST_STRATEGY_01",
+      "path": "/root/apex-system/strategies/TEST_STRATEGY_01",
+      "enabled": true
+    }
+  ]
+}

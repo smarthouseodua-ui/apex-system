@@ -18,8 +18,26 @@ def get_notifier() -> "TelegramNotifier | None":
     """Возвращает синглтон TelegramNotifier или None если токен не задан."""
     global _notifier
     if _notifier is None:
-        token   = os.getenv("TELEGRAM_BOT_TOKEN")   or os.getenv("APPS_SYSTEM_BOT_TOKEN")
-        chat_id = os.getenv("TELEGRAM_CHAT_ID")      or os.getenv("APPS_SYSTEM_BOT_CHAT_ID")
+        token   = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("APPS_SYSTEM_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID") or os.getenv("APPS_SYSTEM_BOT_CHAT_ID")
+        # Fallback — читаем из .env файла если переменные не заданы
+        if not token or not chat_id:
+            try:
+                env_path = "/root/apex-system/.env"
+                for line in open(env_path).read().splitlines():
+                    if "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip()
+                        if k == "TELEGRAM_BOT_TOKEN" and not token:
+                            token = v
+                        if k == "TELEGRAM_CHAT_ID" and not chat_id:
+                            chat_id = v
+                        if k == "APPS_SYSTEM_BOT_TOKEN" and not token:
+                            token = v
+                        if k == "APPS_SYSTEM_BOT_CHAT_ID" and not chat_id:
+                            chat_id = v
+            except Exception:
+                pass
         if token and chat_id:
             _notifier = TelegramNotifier(token, int(chat_id))
         else:
@@ -52,32 +70,59 @@ class TelegramNotifier:
         tp3       = position.get("tp3", 0)
         size_usdt = position.get("risk_usdt") or round(position.get("size", 0) * entry, 2)
         sl_pct    = abs(entry - sl) / entry * 100 if entry else 0
+        exchange  = position.get("exchange_name", "bybit").upper()
+        exchange_icon = "🟡" if exchange == "BINANCE" else "🔵"
+        lines = [
+            "⚡ ОТКРЫТА СДЕЛКА",
+            f"{exchange_icon} {exchange}",
+            f"📌 {symbol} | {direction}",
+            f"📥 Entry: {entry}",
+            f"🛡 SL: {sl} (-{sl_pct:.1f}%)",
+            f"🎯 TP1: {tp1} | TP2: {tp2} | TP3: {tp3}",
+            f"💰 Размер: ${size_usdt}",
+        ]
+        await self.send("\n".join(lines))
 
-        text = (
-            f"⚡ ОТКРЫТА СДЕЛКА\n"
-            f"📌 {symbol} | {direction}\n"
-            f"📥 Entry: {entry}\n"
-            f"🛡 SL: {sl} (-{sl_pct:.1f}%)\n"
-            f"🎯 TP1: {tp1} | TP2: {tp2} | TP3: {tp3}\n"
-            f"💰 Размер: ${size_usdt}"
-        )
-        await self.send(text)
-
-    async def notify_close(self, result: dict) -> None:
+        async def notify_close(self, result: dict) -> None:
         """Уведомление о закрытии сделки."""
         symbol       = result.get("symbol", "?")
         direction    = result.get("direction", "long").upper()
         close_reason = result.get("close_reason", "?")
-        pnl_usdt     = result.get("pnl_usdt", 0)
 
-        duration = "?"
-        opened_at_str    = result.get("opened_at")
-        finalized_at_str = result.get("finalized_at")
-        if opened_at_str and finalized_at_str:
+        # --- Финансы ---
+        gross_pnl = result.get("gross_pnl_usdt", 0) or 0
+        fee_usdt  = result.get("total_fees_usdt", 0) or 0
+        net_pnl   = result.get("net_pnl_usdt") or result.get("pnl_usdt", 0) or 0
+
+        # --- Длительность: duration_minutes → closed_at - opened_at → "—" ---
+        duration = None
+        dm = result.get("duration_minutes")
+        if dm is not None:
             try:
-                opened_dt    = datetime.fromisoformat(opened_at_str)
-                finalized_dt = datetime.fromisoformat(finalized_at_str)
-                duration = int((finalized_dt - opened_dt).total_seconds() / 60)
+                duration = round(float(dm))
+            except (ValueError, TypeError):
+                pass
+
+        if duration is None:
+            opened_at_str = result.get("opened_at")
+            closed_at_str = result.get("finalized_at") or result.get("closed_at")
+            if opened_at_str and closed_at_str:
+                try:
+                    opened_dt = datetime.fromisoformat(str(opened_at_str))
+                    closed_dt = datetime.fromisoformat(str(closed_at_str))
+                    duration = round((closed_dt - opened_dt).total_seconds() / 60)
+                except Exception:
+                    pass
+
+        duration_str = f"{duration} мин" if duration is not None else "—"
+
+        # --- Время закрытия HH:MM ---
+        closed_time = "—"
+        closed_at_raw = result.get("closed_at") or result.get("finalized_at")
+        if closed_at_raw:
+            try:
+                closed_dt = datetime.fromisoformat(str(closed_at_raw))
+                closed_time = closed_dt.strftime("%H:%M")
             except Exception:
                 pass
 
@@ -85,8 +130,11 @@ class TelegramNotifier:
             f"🔒 ЗАКРЫТА СДЕЛКА\n"
             f"📌 {symbol} | {direction}\n"
             f"📤 Закрыто по: {close_reason}\n"
-            f"💵 PnL: {pnl_usdt:+.2f} USDT\n"
-            f"⏱ Время: {duration} мин"
+            f"💰 PnL: {gross_pnl:+.2f} USDT\n"
+            f"💸 Комиссия: {fee_usdt:.2f} USDT\n"
+            f"🧾 Net PnL: {net_pnl:+.2f} USDT\n"
+            f"⏱ Время сделки: {duration_str}\n"
+            f"🕓 Закрыта: {closed_time}"
         )
         await self.send(text)
 

@@ -15,8 +15,8 @@ logger = logging.getLogger("apex.pre_session_smc")
 _SESSION_OPEN = {
     "ASIA": 60,        # 01:00
     "HONG_KONG": 150,  # 02:30
-    "LONDON": 540,     # 09:00
-    "NEW_YORK": 870,   # 14:30
+    "LONDON": 480,     # 08:00
+    "NEW_YORK": 900,   # 15:00
 }
 
 
@@ -26,7 +26,7 @@ class PreSessionAnalyzer:
         self.config = config
         self.exchange = exchange_service
         self.repo = repo
-        self.semaphore = asyncio.Semaphore(5)
+        self.semaphore = asyncio.Semaphore(1)
 
     async def analyze(self, session_name: str, symbol_limit: int = None) -> list[dict]:
         """Запускает SMC-анализ для всех пар universe перед сессией."""
@@ -90,6 +90,7 @@ class PreSessionAnalyzer:
                                pre_start: str, session_open: str) -> dict | None:
         async with self.semaphore:
             try:
+                await asyncio.sleep(0.5)
                 ohlcv = await self.exchange.get_ohlcv(symbol, "1h", 100)
                 if not ohlcv or len(ohlcv) < 20:
                     return None

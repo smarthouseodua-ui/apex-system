@@ -1,3 +1,4 @@
+import asyncio
 """
 APEX PROTOCOL™ — Strategy Engine
 ORB (Opening Range Breakout) — строго по APEX_ORB_UNIFIED_SPEC v1.0
@@ -20,7 +21,57 @@ SESSION_TZ = {
     "TEST_1":    pytz.timezone("Europe/Podgorica"),
     "TEST_2":    pytz.timezone("Europe/Podgorica"),
     "TEST_3":    pytz.timezone("Europe/Podgorica"),
+    "MANUAL":    pytz.timezone("Europe/Podgorica"),
 }
+
+ENTRY_MINUTES = 600
+OBSERVATION_MINUTES = 30
+
+
+def _safe_sl(entry_price: float, sl: float, direction: str) -> float:
+    """Гарантирует что SL != entry. Если равны — сдвигаем на минимальный шаг."""
+    if round(sl, 6) == round(entry_price, 6):
+        # Определяем минимальный шаг от величины цены
+        if entry_price >= 1000:
+            step = 0.1
+        elif entry_price >= 100:
+            step = 0.01
+        elif entry_price >= 1:
+            step = 0.001
+        elif entry_price >= 0.01:
+            step = 0.0001
+        elif entry_price >= 0.001:
+            step = 0.00001
+        else:
+            step = 0.000001
+
+        if direction == "long":
+            sl = round(entry_price - step, 6)
+        else:
+            sl = round(entry_price + step, 6)
+
+        logger.warning(f"[SL_FIX] sl==entry detected → sl adjusted to {sl}")
+
+    return sl
+
+
+def _apply_min_sl_guard(entry: float, sl: float, direction: str) -> float:
+    """Гарантирует минимальную дистанцию SL не менее 0.15% от entry."""
+    try:
+        if entry is None or sl is None:
+            return sl
+        MIN_SL_PCT = 0.0015  # 0.15%
+        sl_distance_pct = abs(entry - sl) / entry
+        if sl_distance_pct >= MIN_SL_PCT:
+            return sl
+        if direction.lower() == "long":
+            new_sl = round(entry * (1 - MIN_SL_PCT), 6)
+        else:
+            new_sl = round(entry * (1 + MIN_SL_PCT), 6)
+        logger.warning(f"[MIN_SL_GUARD] sl_pct={sl_distance_pct*100:.4f}% < 0.15% → sl adjusted to {new_sl}")
+        return new_sl
+    except Exception:
+        return sl
 
 
 class StrategyEngine:
@@ -29,6 +80,7 @@ class StrategyEngine:
         self.config = config
         self.event_bus = event_bus
         self.exchange_service = None
+        self._exchange_services = {}
         self._connected = False
         self.repo = None
         self._orb_states: dict[str, dict] = {}
@@ -39,9 +91,25 @@ class StrategyEngine:
             self.exchange_service = ExchangeService(self.config)
             await self.exchange_service.connect()
             self._connected = True
+        # Router — подключаем активные биржи
+        from services.exchanges.exchange_router import get_exchange_services
+        self._exchange_services = get_exchange_services(self.config)
+        for name, svc in self._exchange_services.items():
+            try:
+                await svc.connect()
+            except Exception:
+                pass
         if self.repo is None:
             from storage.db.repository import Repository
             self.repo = Repository()
+
+
+    async def _get_ohlcv(self, symbol: str, timeframe: str, limit: int, exchange_name: str = "bybit") -> list:
+        """Получить OHLCV с правильной биржи."""
+        svc = self._exchange_services.get(exchange_name)
+        if svc:
+            return await svc.get_ohlcv(symbol, timeframe, limit)
+        return await self.exchange_service.get_ohlcv(symbol, timeframe, limit)
 
     async def analyze(self, candidates: list) -> list:
         try:
@@ -52,11 +120,12 @@ class StrategyEngine:
                 return []
 
             now_utc = datetime.now(timezone.utc)
-            exec_window_end = session_open_utc + timedelta(minutes=90)
+            exec_window_end = session_open_utc + timedelta(minutes=ENTRY_MINUTES)
 
             if now_utc < session_open_utc:
                 logger.info(f"StrategyEngine [{session_name}]: сессия ещё не открылась")
                 return []
+
             if now_utc >= exec_window_end:
                 logger.info(f"StrategyEngine [{session_name}]: Execution Window закрыто")
                 return []
@@ -65,7 +134,7 @@ class StrategyEngine:
 
             signals = []
             for candidate in candidates:
-                signal = await self._process_candidate(candidate, session_name, session_open_utc, now_utc)
+                signal = await self._process_candidate(candidate, session_name, session_open_utc)
                 if signal:
                     signals.append(signal)
 
@@ -79,64 +148,112 @@ class StrategyEngine:
 
         except Exception as e:
             logger.error(f"StrategyEngine error: {e}", exc_info=True)
+            try:
+                import traceback as _tb
+                from storage.db.repository import Repository as _Repo
+                _Repo().log_system_event(event="STRATEGY_ENGINE_ERROR", module="strategy_engine", message=str(e), level="ERROR", traceback=_tb.format_exc())
+            except Exception:
+                pass
             return []
 
-    async def _process_candidate(self, candidate, session_name, session_open_utc, now_utc):
+    async def _process_candidate(self, candidate, session_name, session_open_utc):
         symbol = candidate.get("symbol")
         try:
-            orb = await self._build_orb(symbol, session_open_utc)
+            orb = await self._build_orb(symbol, session_open_utc, candidate.get("exchange_name", "bybit"))
             if not orb:
                 return None
 
-            breakout = await self._detect_breakout(symbol, orb, session_open_utc)
+            breakout = await self._detect_breakout(symbol, orb, session_open_utc, candidate.get("exchange_name", "bybit"))
             if not breakout:
                 return None
 
-            retest = await self._wait_retest(symbol, orb, breakout)
-
-            confirmation = await self._confirm_entry(symbol, breakout["direction"])
+            retest = await self._wait_retest(symbol, orb, breakout, candidate.get("exchange_name", "bybit"))
+            confirmation = await self._confirm_entry(symbol, breakout["direction"], candidate.get("exchange_name", "bybit"))
             if not confirmation:
                 return None
 
-            exec_window_end = session_open_utc + timedelta(minutes=90)
-            if datetime.now(timezone.utc) >= exec_window_end:
+            now_utc = datetime.now(timezone.utc)
+            exec_window_end = session_open_utc + timedelta(minutes=ENTRY_MINUTES)
+            if now_utc >= exec_window_end:
                 logger.info(f"[CANCEL] {symbol}: время вышло за Execution Window")
                 return None
 
-            direction   = breakout["direction"]
+            direction = breakout["direction"]
             entry_price = confirmation["entry_price"]
 
             if direction == "long":
-                sl = retest["low"] if retest else breakout["candle_close"] * 0.996
-                R  = entry_price - sl
+                sl_raw = retest["low"] if retest else breakout["candle_close"] * 0.996
+                r_value = entry_price - sl_raw
             else:
-                sl = retest["high"] if retest else breakout["candle_close"] * 1.004
-                R  = sl - entry_price
+                sl_raw = retest["high"] if retest else breakout["candle_close"] * 1.004
+                r_value = sl_raw - entry_price
 
-            if R <= 0:
+            if r_value <= 0:
                 logger.warning(f"[CANCEL] {symbol}: R <= 0")
                 return None
 
-            # Минимальный R: не менее 0.05% от цены входа
-            min_R = entry_price * 0.0005
-            if R < min_R:
-                logger.warning(f"[CANCEL] {symbol}: R={R:.6f} слишком мал (min={min_R:.6f})")
+            # Защита: sl не должен равняться entry
+            sl = _safe_sl(entry_price, sl_raw, direction)
+            # Защита: минимальная дистанция SL >= 0.15%
+            sl = _apply_min_sl_guard(entry_price, sl, direction)
+
+            # Пересчёт R после возможной коррекции sl
+            if direction == "long":
+                r_value = entry_price - sl
+            else:
+                r_value = sl - entry_price
+
+            if r_value <= 0:
+                logger.warning(f"[CANCEL] {symbol}: R <= 0 after sl fix")
                 return None
 
-            # Минимальный R: не менее 0.05% от цены входа
-            min_R = entry_price * 0.0005
-            if R < min_R:
-                logger.warning(f"[CANCEL] {symbol}: R={R:.6f} слишком мал (min={min_R:.6f})")
-                return None
+            tp1 = entry_price + r_value if direction == "long" else entry_price - r_value
+            tp2 = entry_price + 2 * r_value if direction == "long" else entry_price - 2 * r_value
+            tp3 = entry_price + 3 * r_value if direction == "long" else entry_price - 3 * r_value
 
-            tp1 = entry_price + R   if direction == "long" else entry_price - R
-            tp2 = entry_price + 2*R if direction == "long" else entry_price - 2*R
-            tp3 = entry_price + 3*R if direction == "long" else entry_price - 3*R
+            obs_start = session_open_utc + timedelta(minutes=ENTRY_MINUTES)
+            hard_close = obs_start + timedelta(minutes=OBSERVATION_MINUTES)
+            tz = SESSION_TZ.get(session_name, PODGORICA)
+            now_local = datetime.now(tz)
 
-            obs_start  = session_open_utc + timedelta(minutes=90)
-            hard_close = session_open_utc + timedelta(minutes=120)
-            tz         = SESSION_TZ.get(session_name, PODGORICA)
-            now_local  = datetime.now(tz)
+            # Читаем setup_name из test_control
+            setup_name = "APEX_ORB_5M"
+            strategy_family = "ORB"
+            strategy_version = "v1"
+            setup_variant = "A"
+            try:
+                from services.test_control import read as tc_read
+                tc = tc_read()
+                setup_name = tc.get("setup_name", "APEX_ORB_5M")
+                strategy_family = tc.get("strategy_family", "ORB")
+                strategy_version = tc.get("strategy_version", "v1")
+                setup_variant = tc.get("setup_variant", "A")
+            except Exception:
+                pass
+
+            # ── Derived fields for APEX_MASTER_TRADE ──
+            _score = candidate.get("score") or 0
+            if _score >= 80:
+                _setup_grade = "A"
+            elif _score >= 65:
+                _setup_grade = "B"
+            elif _score >= 50:
+                _setup_grade = "C"
+            else:
+                _setup_grade = "D"
+
+            if _score >= 70:
+                _entry_quality = "GOOD"
+            elif _score >= 50:
+                _entry_quality = "FAIR"
+            else:
+                _entry_quality = "WEAK"
+
+            try:
+                from modules.config import DEFAULT_BALANCE as _def_bal
+                _balance_snapshot = _def_bal
+            except Exception:
+                _balance_snapshot = 0.0
 
             signal = {
                 "symbol":                   symbol,
@@ -144,10 +261,14 @@ class StrategyEngine:
                 "session_name":             session_name,
                 "timezone":                 str(tz),
                 "strategy":                 "APEX_ORB",
+                "strategy_family":          strategy_family,
+                "strategy_version":         strategy_version,
+                "setup_name":               setup_name,
+                "setup_variant":            setup_variant,
                 "timeframe":                "5m",
                 "session_open_time":        session_open_utc.isoformat(),
                 "execution_window_start":   session_open_utc.isoformat(),
-                "execution_window_end":     exec_window_end.isoformat(),
+                "execution_window_end":     (session_open_utc + timedelta(minutes=ENTRY_MINUTES)).isoformat(),
                 "observation_window_start": obs_start.isoformat(),
                 "hard_close_time":          hard_close.isoformat(),
                 "orb_high":                 orb["orb_high"],
@@ -163,7 +284,7 @@ class StrategyEngine:
                 "tp1":                      round(tp1, 6),
                 "tp2":                      round(tp2, 6),
                 "tp3":                      round(tp3, 6),
-                "risk_R_value":             round(R, 6),
+                "risk_R_value":             round(r_value, 6),
                 "confidence":               1.0,
                 "generated_at":             datetime.now(PODGORICA).strftime("%Y-%m-%dT%H:%M:%S"),
                 "score":                    candidate.get("score"),
@@ -172,32 +293,47 @@ class StrategyEngine:
                 "reasons":                  candidate.get("reasons", []),
                 "candidate_status":         candidate.get("candidate_status"),
                 "scanned_at":               candidate.get("scanned_at"),
+                "source_pipeline":          "apex-pipeline",
+                "event_context":            "NORMAL",
+                "account_balance_snapshot":  _balance_snapshot,
+                "risk_model_name":          "FIXED",
+                "filter_score":             candidate.get("score"),
+                "confidence_score":         candidate.get("score"),
+                "setup_grade":              _setup_grade,
+                "entry_quality_flag":       _entry_quality,
+                "market_phase":             candidate.get("market_phase", "UNKNOWN"),
             }
 
             logger.info(
                 f"[SIGNAL] {symbol} {direction.upper()} | "
                 f"entry={entry_price:.4f} SL={sl:.4f} "
-                f"TP1={tp1:.4f} TP2={tp2:.4f} TP3={tp3:.4f} R={R:.6f}"
+                f"TP1={tp1:.4f} TP2={tp2:.4f} TP3={tp3:.4f} R={r_value:.6f}"
             )
             return signal
 
         except Exception as e:
             logger.error(f"_process_candidate {symbol}: {e}", exc_info=True)
+            try:
+                import traceback as _tb
+                from storage.db.repository import Repository as _Repo
+                _Repo().log_system_event(event="PROCESS_CANDIDATE_ERROR", module="strategy_engine", message=f"{symbol}: {e}", level="ERROR", traceback=_tb.format_exc())
+            except Exception:
+                pass
             return None
 
-    async def _build_orb(self, symbol, session_open_utc):
+    async def _build_orb(self, symbol, session_open_utc, exchange_name="bybit"):
         try:
-            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=10)
+            await asyncio.sleep(1.5)
+            candles = await self._get_ohlcv(symbol, "5m", 10, exchange_name)
             if not candles or len(candles) < 2:
                 return None
 
-            open_ts_ms    = int(session_open_utc.timestamp() * 1000)
-            range_end_ms  = open_ts_ms + 5 * 60 * 1000
-            now_ms        = int(datetime.now(timezone.utc).timestamp() * 1000)
+            open_ts_ms = int(session_open_utc.timestamp() * 1000)
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
             range_candle = None
             for c in candles:
-                if c[0] >= open_ts_ms and (c[0] + 5*60*1000) <= now_ms:
+                if c[0] >= open_ts_ms and (c[0] + 5 * 60 * 1000) <= now_ms:
                     range_candle = c
                     break
 
@@ -205,7 +341,7 @@ class StrategyEngine:
                 range_candle = candles[-2]
 
             orb_high = range_candle[2]
-            orb_low  = range_candle[3]
+            orb_low = range_candle[3]
             orb_size = orb_high - orb_low
 
             if orb_size <= 0:
@@ -213,17 +349,24 @@ class StrategyEngine:
 
             return {
                 "orb_high": round(orb_high, 6),
-                "orb_low":  round(orb_low,  6),
-                "orb_mid":  round((orb_high + orb_low) / 2, 6),
+                "orb_low": round(orb_low, 6),
+                "orb_mid": round((orb_high + orb_low) / 2, 6),
                 "orb_size": round(orb_size, 6),
             }
         except Exception as e:
             logger.error(f"_build_orb {symbol}: {e}")
+            try:
+                import traceback as _tb
+                from storage.db.repository import Repository as _Repo
+                _Repo().log_system_event(event="BUILD_ORB_ERROR", module="strategy_engine", message=f"{symbol}: {e}", level="ERROR", traceback=_tb.format_exc())
+            except Exception:
+                pass
             return None
 
-    async def _detect_breakout(self, symbol, orb, session_open_utc):
+    async def _detect_breakout(self, symbol, orb, session_open_utc, exchange_name="bybit"):
         try:
-            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=20)
+            await asyncio.sleep(1.5)
+            candles = await self._get_ohlcv(symbol, "5m", 20, exchange_name)
             if not candles:
                 return None
 
@@ -232,74 +375,99 @@ class StrategyEngine:
             for c in candles:
                 if c[0] < range_end_ts:
                     continue
+
                 candle_close = c[4]
                 if candle_close > orb["orb_high"]:
-                    return {"direction": "long",  "candle_ts": c[0], "candle_close": candle_close}
-                elif candle_close < orb["orb_low"]:
+                    return {"direction": "long", "candle_ts": c[0], "candle_close": candle_close}
+                if candle_close < orb["orb_low"]:
                     return {"direction": "short", "candle_ts": c[0], "candle_close": candle_close}
 
             return None
         except Exception as e:
             logger.error(f"_detect_breakout {symbol}: {e}")
+            try:
+                import traceback as _tb
+                from storage.db.repository import Repository as _Repo
+                _Repo().log_system_event(event="DETECT_BREAKOUT_ERROR", module="strategy_engine", message=f"{symbol}: {e}", level="ERROR", traceback=_tb.format_exc())
+            except Exception:
+                pass
             return None
 
-    async def _wait_retest(self, symbol, orb, breakout):
+    async def _wait_retest(self, symbol, orb, breakout, exchange_name="bybit"):
         try:
-            candles = await self.exchange_service.get_ohlcv(symbol, "5m", limit=20)
+            await asyncio.sleep(1.5)
+            candles = await self._get_ohlcv(symbol, "5m", 20, exchange_name)
             if not candles:
                 return None
 
-            direction   = breakout["direction"]
+            direction = breakout["direction"]
             breakout_ts = breakout["candle_ts"]
-            orb_high    = orb["orb_high"]
-            orb_low     = orb["orb_low"]
+            orb_high = orb["orb_high"]
+            orb_low = orb["orb_low"]
 
             for c in candles:
                 if c[0] <= breakout_ts:
                     continue
 
-                high  = c[2]; low = c[3]; close = c[4]
+                high = c[2]
+                low = c[3]
+                close = c[4]
 
                 if direction == "long":
                     if close < orb_high:
-                        return None  # инвалидация
+                        return None
                     if low <= orb_high and close >= orb_high:
                         return {"candle_ts": c[0], "high": high, "low": low, "close": close}
                 else:
                     if close > orb_low:
-                        return None  # инвалидация
+                        return None
                     if high >= orb_low and close <= orb_low:
                         return {"candle_ts": c[0], "high": high, "low": low, "close": close}
 
             return None
         except Exception as e:
             logger.error(f"_wait_retest {symbol}: {e}")
+            try:
+                import traceback as _tb
+                from storage.db.repository import Repository as _Repo
+                _Repo().log_system_event(event="WAIT_RETEST_ERROR", module="strategy_engine", message=f"{symbol}: {e}", level="ERROR", traceback=_tb.format_exc())
+            except Exception:
+                pass
             return None
 
-    async def _confirm_entry(self, symbol, direction):
+    async def _confirm_entry(self, symbol, direction, exchange_name="bybit"):
         try:
-            candles_1m = await self.exchange_service.get_ohlcv(symbol, "1m", limit=5)
+            await asyncio.sleep(1.5)
+            candles_1m = await self._get_ohlcv(symbol, "1m", 5, exchange_name)
             if not candles_1m or len(candles_1m) < 2:
                 return None
 
             prev = candles_1m[-2]
             curr = candles_1m[-1]
 
-            prev_open  = prev[1]; prev_high = prev[2]
-            prev_low   = prev[3]; prev_close = prev[4]
-            curr_open  = curr[1]; curr_high = curr[2]
-            curr_low   = curr[3]; curr_close = curr[4]
+            prev_open = prev[1]
+            prev_high = prev[2]
+            prev_low = prev[3]
+            prev_close = prev[4]
+            curr_open = curr[1]
+            curr_high = curr[2]
+            curr_low = curr[3]
+            curr_close = curr[4]
 
             confirmed = False
 
             if direction == "long":
-                engulfing = (curr_close > curr_open and prev_close < prev_open
-                             and curr_open <= prev_close and curr_close >= prev_open)
+                engulfing = (
+                    curr_close > curr_open and prev_close < prev_open
+                    and curr_open <= prev_close and curr_close >= prev_open
+                )
                 confirmed = engulfing or (curr_close > prev_high)
 
             elif direction == "short":
-                engulfing = (curr_close < curr_open and prev_close > prev_open
-                             and curr_open >= prev_close and curr_close <= prev_open)
+                engulfing = (
+                    curr_close < curr_open and prev_close > prev_open
+                    and curr_open >= prev_close and curr_close <= prev_open
+                )
                 confirmed = engulfing or (curr_close < prev_low)
 
             if not confirmed:
@@ -309,22 +477,58 @@ class StrategyEngine:
 
         except Exception as e:
             logger.error(f"_confirm_entry {symbol}: {e}")
+            try:
+                import traceback as _tb
+                from storage.db.repository import Repository as _Repo
+                _Repo().log_system_event(event="CONFIRM_ENTRY_ERROR", module="strategy_engine", message=f"{symbol}: {e}", level="ERROR", traceback=_tb.format_exc())
+            except Exception:
+                pass
             return None
 
     def _get_active_session(self):
         try:
-            from core.session_engine import _ALL_SESSIONS, get_session_state
-            now_utc = datetime.now(timezone.utc)
+            # manual_entry_enabled override — игнорирует сессии
+            try:
+                from services.test_control import read as tc_read
+                if tc_read().get("manual_entry_enabled"):
+                    now_utc = datetime.now(timezone.utc)
+                    session_open_utc = now_utc.replace(
+                        minute=0, second=0, microsecond=0
+                    )
+                    logger.info("StrategyEngine: MANUAL mode — сессия игнорируется")
+                    return "MANUAL", session_open_utc
+            except Exception:
+                pass
 
-            for name in _ALL_SESSIONS:
-                state = get_session_state(name)
-                if state.get("фаза") == "ВХОД":
-                    open_str = _ALL_SESSIONS[name]["open"]
-                    h, m = map(int, open_str.split(":"))
-                    open_dt = now_utc.replace(hour=h, minute=m, second=0, microsecond=0)
-                    return name, open_dt
+            from core.time_manager import TimeManager
 
-            return None, None
+            tm = TimeManager(self.config)
+            session_name = tm.current_session()
+            if not session_name or session_name == "OFF":
+                return None, None
+
+            now_pg = datetime.now(PODGORICA)
+            session_opens = {
+                "ASIA": (1, 0),
+                "HONG_KONG": (2, 30),
+                "LONDON": (8, 0),
+                "NEW_YORK": (14, 30),
+            }
+
+            if session_name not in session_opens:
+                return None, None
+
+            h, m = session_opens[session_name]
+            open_pg = now_pg.replace(hour=h, minute=m, second=0, microsecond=0)
+            open_utc = open_pg.astimezone(timezone.utc)
+
+            return session_name, open_utc
         except Exception as e:
             logger.error(f"_get_active_session: {e}")
+            try:
+                import traceback as _tb
+                from storage.db.repository import Repository as _Repo
+                _Repo().log_system_event(event="GET_SESSION_ERROR", module="strategy_engine", message=str(e), level="ERROR", traceback=_tb.format_exc())
+            except Exception:
+                pass
             return None, None

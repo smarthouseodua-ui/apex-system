@@ -1,0 +1,1147 @@
+import logging
+import os
+import sqlite3
+
+from telegram import Update
+from telegram.ext import ContextTypes
+
+from services.telegram.keyboard import (
+    main_menu,
+    status_menu,
+    scanner_menu,
+    scanner_mode_menu,
+    scanner_pairs_menu,
+    scanner_filters_menu,
+    wau_menu,
+    settings_menu,
+    auto_menu,
+    limits_menu,
+    exchange_menu,
+    strategy_menu,
+    confirm_stop_menu,
+)
+
+logger = logging.getLogger("apex.telegram")
+
+DB_PATH = "/root/apex-system/storage/db/sqlite/apex.db"
+
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ============================================================
+
+def _db_exists() -> bool:
+    return os.path.exists(DB_PATH)
+
+
+def _db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _safe_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _fmt_dt(value) -> str:
+    if not value:
+        return "—"
+    return str(value).replace("T", " ")[:19]
+
+
+def _line(label: str, value: str, width: int = 18) -> str:
+    return f"{label}: {value}"
+
+
+def _pre(lines: list[str]) -> str:
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+
+def _get_test_control() -> dict:
+    try:
+        from services.test_control import read as tc_read
+        return tc_read() or {}
+    except Exception:
+        return {}
+
+
+def _write_test_control(payload: dict) -> dict:
+    try:
+        from services.test_control import write as tc_write
+        return tc_write(payload) or {}
+    except Exception:
+        return {}
+
+
+def _get_runtime_scanner() -> dict:
+    try:
+        from modules.runtime_state import load_runtime_state
+        state = load_runtime_state() or {}
+        return state.get("scanner", {}) or {}
+    except Exception:
+        return {}
+
+
+def _get_session_info() -> dict:
+    """Определяет текущую сессию по UTC эталону."""
+    try:
+        from datetime import datetime, timezone
+        from core.time_manager import time_features_for_dt
+
+        now_utc = datetime.now(timezone.utc)
+        tf = time_features_for_dt(now_utc.isoformat())
+        session_name = tf.get("session_name", "OFF")
+        overlap = tf.get("event_overlap_london_ny", 0)
+
+        utc_min = now_utc.hour * 60 + now_utc.minute
+        _UTC_ENDS = {"ASIA": 8 * 60, "LONDON": 13 * 60, "NEW_YORK": 21 * 60}
+        end_min = _UTC_ENDS.get(session_name)
+
+        if end_min:
+            left = end_min - utc_min
+            time_left = f"{left} мин"
+            phase = "ВХОД"
+            signal_allowed = True
+        else:
+            time_left = "—"
+            phase = "Ожидание"
+            signal_allowed = False
+
+        session_display = {
+            "ASIA": "Азия",
+            "LONDON": "Лондон",
+            "NEW_YORK": "Нью-Йорк",
+            "OFF": "Закрыто",
+            "MANUAL": "Ручной режим",
+        }.get(session_name, session_name)
+
+        if overlap:
+            session_display += " + Overlap"
+
+        return {
+            "name": session_display,
+            "phase": phase,
+            "time_left": time_left,
+            "signal_allowed": signal_allowed,
+        }
+    except Exception:
+        return {
+            "name": "—",
+            "phase": "—",
+            "time_left": "—",
+            "signal_allowed": False,
+        }
+
+
+def _get_status_data() -> dict:
+    tc = _get_test_control()
+    scanner = _get_runtime_scanner()
+    session = _get_session_info()
+
+    data = {
+        "торговля_вкл": bool(tc.get("trading_enabled", False)),
+        "сканер_вкл": bool(tc.get("scanner_enabled", False)),
+        "входы_вкл": bool(tc.get("entries_enabled", False)),
+        "монитор_вкл": bool(tc.get("monitor_enabled", False)),
+        "стратегия": tc.get("active_filter", "—"),
+        "направление": tc.get("direction", "both"),
+        "режим": tc.get("strategy_mode", tc.get("mode", "—")),
+        "сессия": session.get("name", "Неизвестно"),
+        "фаза": session.get("phase", "—"),
+        "до_конца": session.get("time_left", "—"),
+        "вход_разрешён": session.get("signal_allowed", False),
+        "баланс": _safe_float(tc.get("test_balance", 0), 0.0),
+        "пополнение": _safe_float(tc.get("manual_topup_total", 0), 0.0),
+        "sl": tc.get("param_sl_pct", "—"),
+        "tp1": tc.get("param_tp1_pct", "—"),
+        "tp2": tc.get("param_tp2_pct", "—"),
+        "tp3": tc.get("param_tp3_pct", "—"),
+        "плечо": tc.get("param_leverage", "—"),
+        "размер": tc.get("param_size_usdt", "—"),
+        "риск": tc.get("param_risk_usdt", "выкл"),
+        "лимит_позиций": tc.get("max_positions", 50),
+        "режим_сканера": tc.get("scanner_mode_label", "Ручной"),
+        "лимит_пар": _safe_int(tc.get("scanner_pairs_limit", 20), 20),
+        "всего_пар": _safe_int(scanner.get("total_pairs", 0), 0),
+        "после_ликв": _safe_int(scanner.get("after_liquidity", 0), 0),
+        "после_вол": _safe_int(scanner.get("after_volatility", 0), 0),
+        "после_структ": _safe_int(scanner.get("after_structure", 0), 0),
+        "кандидаты": _safe_int(scanner.get("candidates", 0), 0),
+        "сигналы": _safe_int(scanner.get("signals", 0), 0),
+        "лучший_балл": _safe_float(scanner.get("top_score", 0), 0.0),
+        "последний_отказ": scanner.get("last_reject_reason", "—"),
+    }
+
+    if not _db_exists():
+        data.update({
+            "открыто": 0,
+            "сделок_сегодня": 0,
+            "прибыль_сегодня": 0.0,
+            "средства": data["баланс"],
+            "последняя_сделка": "—",
+            "побед": 0,
+            "поражений": 0,
+            "безубыток": 0,
+            "винрейт": "0%",
+            "auto_trades": 0, "auto_pnl": 0.0,
+            "auto_wins": 0, "auto_losses": 0, "auto_be": 0, "auto_wr": "0%",
+            "manual_trades": 0, "manual_pnl": 0.0,
+            "manual_wins": 0, "manual_losses": 0, "manual_be": 0, "manual_wr": "0%",
+        })
+        return data
+
+    try:
+        conn = _db()
+        trade_ts_expr = "COALESCE(finalized_at, closed_at, opened_at)"
+
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM APEX_MASTER_TRADE
+            WHERE row_status = 'active'
+              AND mode_layer IN ('AUTO','MANUAL')
+            """
+        ).fetchone()
+        открыто = _safe_int(row["cnt"] if row else 0, 0)
+
+        row_auto = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS trades_today,
+                ROUND(COALESCE(SUM(pnl_usdt), 0), 4) AS pnl_today,
+                SUM(CASE WHEN COALESCE(pnl_usdt, 0) > 0 THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN COALESCE(pnl_usdt, 0) < 0 THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN COALESCE(pnl_usdt, 0) = 0 THEN 1 ELSE 0 END) AS be
+            FROM APEX_MASTER_TRADE
+            WHERE date({trade_ts_expr}, '+2 hours') = date('now', '+2 hours')
+              AND COALESCE(close_reason, '') != 'MANUAL_CLEAR'
+              AND mode_layer = 'AUTO'
+            """
+        ).fetchone()
+
+        auto_trades = _safe_int(row_auto["trades_today"] if row_auto else 0, 0)
+        auto_pnl = _safe_float(row_auto["pnl_today"] if row_auto else 0.0, 0.0)
+        auto_wins = _safe_int(row_auto["wins"] if row_auto else 0, 0)
+        auto_losses = _safe_int(row_auto["losses"] if row_auto else 0, 0)
+        auto_be = _safe_int(row_auto["be"] if row_auto else 0, 0)
+        auto_closed = auto_wins + auto_losses
+        auto_wr = f"{round((auto_wins / auto_closed) * 100, 1)}%" if auto_closed > 0 else "0%"
+
+        row_manual = conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS trades_today,
+                ROUND(COALESCE(SUM(pnl_usdt), 0), 4) AS pnl_today,
+                SUM(CASE WHEN COALESCE(pnl_usdt, 0) > 0 THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN COALESCE(pnl_usdt, 0) < 0 THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN COALESCE(pnl_usdt, 0) = 0 THEN 1 ELSE 0 END) AS be
+            FROM APEX_MASTER_TRADE
+            WHERE date({trade_ts_expr}, '+2 hours') = date('now', '+2 hours')
+              AND COALESCE(close_reason, '') != 'MANUAL_CLEAR'
+              AND mode_layer = 'MANUAL'
+            """
+        ).fetchone()
+
+        manual_trades = _safe_int(row_manual["trades_today"] if row_manual else 0, 0)
+        manual_pnl = _safe_float(row_manual["pnl_today"] if row_manual else 0.0, 0.0)
+        manual_wins = _safe_int(row_manual["wins"] if row_manual else 0, 0)
+        manual_losses = _safe_int(row_manual["losses"] if row_manual else 0, 0)
+        manual_be = _safe_int(row_manual["be"] if row_manual else 0, 0)
+        manual_closed = manual_wins + manual_losses
+        manual_wr = f"{round((manual_wins / manual_closed) * 100, 1)}%" if manual_closed > 0 else "0%"
+
+        сделок_сегодня = auto_trades + manual_trades
+        прибыль_сегодня = round(auto_pnl + manual_pnl, 4)
+        побед = auto_wins + manual_wins
+        поражений = auto_losses + manual_losses
+        безубыток = auto_be + manual_be
+
+        closed_non_be = побед + поражений
+        винрейт = f"{round((побед / closed_non_be) * 100, 1)}%" if closed_non_be > 0 else "0%"
+
+        row = conn.execute(
+            f"""
+            SELECT {trade_ts_expr} AS ts
+            FROM APEX_MASTER_TRADE
+            WHERE mode_layer IN ('AUTO','MANUAL')
+            ORDER BY {trade_ts_expr} DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        последняя_сделка = _fmt_dt(row["ts"] if row else None)
+
+        row = conn.execute(
+            """
+            SELECT ROUND(COALESCE(SUM(pnl_usdt), 0), 4) AS total_realized
+            FROM APEX_MASTER_TRADE
+            WHERE closed_at IS NOT NULL
+              AND COALESCE(close_reason, '') != 'MANUAL_CLEAR'
+              AND mode_layer IN ('AUTO','MANUAL')
+            """
+        ).fetchone()
+        total_realized = _safe_float(row["total_realized"] if row else 0.0, 0.0)
+        средства = round(data["баланс"] + total_realized, 4)
+
+        conn.close()
+
+        data.update({
+            "открыто": открыто,
+            "сделок_сегодня": сделок_сегодня,
+            "прибыль_сегодня": прибыль_сегодня,
+            "средства": средства,
+            "последняя_сделка": последняя_сделка,
+            "побед": побед,
+            "поражений": поражений,
+            "безубыток": безубыток,
+            "винрейт": винрейт,
+            "auto_trades": auto_trades,
+            "auto_pnl": auto_pnl,
+            "auto_wins": auto_wins,
+            "auto_losses": auto_losses,
+            "auto_be": auto_be,
+            "auto_wr": auto_wr,
+            "manual_trades": manual_trades,
+            "manual_pnl": manual_pnl,
+            "manual_wins": manual_wins,
+            "manual_losses": manual_losses,
+            "manual_be": manual_be,
+            "manual_wr": manual_wr,
+        })
+        return data
+
+    except Exception:
+        data.update({
+            "открыто": 0,
+            "сделок_сегодня": 0,
+            "прибыль_сегодня": 0.0,
+            "средства": data["баланс"],
+            "последняя_сделка": "—",
+            "побед": 0,
+            "поражений": 0,
+            "безубыток": 0,
+            "винрейт": "0%",
+            "auto_trades": 0, "auto_pnl": 0.0,
+            "auto_wins": 0, "auto_losses": 0, "auto_be": 0, "auto_wr": "0%",
+            "manual_trades": 0, "manual_pnl": 0.0,
+            "manual_wins": 0, "manual_losses": 0, "manual_be": 0, "manual_wr": "0%",
+        })
+        return data
+
+
+# ============================================================
+# МЕНЮ / НАВИГАЦИЯ
+# ============================================================
+
+def _set_menu(context: ContextTypes.DEFAULT_TYPE, menu_name: str):
+    context.user_data["menu"] = menu_name
+
+
+def _parent_menu(menu_name: str) -> str:
+    mapping = {
+        "status": "main",
+        "scanner": "status",
+        "scanner_mode": "scanner",
+        "scanner_pairs": "scanner",
+        "scanner_filters": "scanner",
+        "wau": "main",
+        "settings": "main",
+        "auto": "settings",
+        "limits": "settings",
+        "exchange": "settings",
+        "strategy": "main",
+        "confirm_stop": "main",
+    }
+    return mapping.get(menu_name, "main")
+
+
+def _menu_markup(menu_name: str):
+    if menu_name == "main":
+        return main_menu()
+    if menu_name == "status":
+        return status_menu()
+    if menu_name == "scanner":
+        return scanner_menu()
+    if menu_name == "scanner_mode":
+        return scanner_mode_menu()
+    if menu_name == "scanner_pairs":
+        return scanner_pairs_menu()
+    if menu_name == "scanner_filters":
+        return scanner_filters_menu()
+    if menu_name == "wau":
+        return wau_menu()
+    if menu_name == "settings":
+        return settings_menu()
+    if menu_name == "auto":
+        return auto_menu()
+    if menu_name == "limits":
+        return limits_menu()
+    if menu_name == "exchange":
+        return exchange_menu()
+    if menu_name == "strategy":
+        return strategy_menu()
+    if menu_name == "confirm_stop":
+        return confirm_stop_menu()
+    return main_menu()
+
+
+# ============================================================
+# ТЕКСТЫ
+# ============================================================
+
+def _build_trading_text() -> str:
+    d = _get_status_data()
+    lines = [
+        "💰 ТОРГОВЛЯ",
+        "────────────────────────",
+        _line("Открыто позиций", f"{d['открыто']} из {d['лимит_позиций']}"),
+        _line("Последняя сделка", d["последняя_сделка"]),
+        "",
+        "🤖 Авто-торговля",
+        _line("Сделки", str(d["auto_trades"])),
+        _line("PnL", f"{d['auto_pnl']} USDT"),
+        _line("W/L/BE", f"{d['auto_wins']} / {d['auto_losses']} / {d['auto_be']}"),
+        _line("WinRate", d["auto_wr"]),
+        "",
+        "✋ Ручной режим",
+        _line("Сделки", str(d["manual_trades"])),
+        _line("PnL", f"{d['manual_pnl']} USDT"),
+        _line("W/L/BE", f"{d['manual_wins']} / {d['manual_losses']} / {d['manual_be']}"),
+        _line("WinRate", d["manual_wr"]),
+        "",
+        "💰 КАПИТАЛ",
+        _line("Баланс", f"{d['баланс']} USDT"),
+        _line("Средства", f"{d['средства']} USDT"),
+        _line("Прибыль сегодня", f"{d['прибыль_сегодня']} USDT"),
+        _line("Доп. пополнение", f"{d['пополнение']} USDT"),
+        "",
+        "⚙️ РИСК / ПАРАМЕТРЫ",
+        _line("Стоп-лосс", f"{d['sl']}%"),
+        _line("Тейк-профит 1", f"{d['tp1']}%"),
+        _line("Тейк-профит 2", f"{d['tp2']}%"),
+        _line("Тейк-профит 3", f"{d['tp3']}%"),
+        _line("Плечо", f"x{d['плечо']}"),
+        _line("Размер позиции", f"{d['размер']} USDT"),
+        _line("Риск", f"{d['риск']} USDT" if d["риск"] != "выкл" else "фиксированный"),
+    ]
+    return _pre(lines)
+
+
+def _build_system_text() -> str:
+    d = _get_status_data()
+
+    direction_map = {
+        "both": "LONG + SHORT",
+        "long": "LONG",
+        "short": "SHORT",
+    }
+    mode_map = {
+        "RUN_MODE": "Рабочий",
+        "ON": "Включён",
+        "OFF": "Выключен",
+    }
+
+    lines = [
+        "🛠 СОСТОЯНИЕ",
+        "────────────────────────",
+        _line("Торговля", "✅" if d["торговля_вкл"] else "❌"),
+        _line("Сканер", "✅" if d["сканер_вкл"] else "❌"),
+        _line("Входы", "✅" if d["входы_вкл"] else "❌"),
+        _line("Монитор", "✅" if d["монитор_вкл"] else "❌"),
+        "",
+        "🎯 РЕЖИМ",
+        _line("Стратегия", d["стратегия"]),
+        _line("Направление", direction_map.get(str(d["направление"]).lower(), str(d["направление"]))),
+        _line("Режим", mode_map.get(str(d["режим"]), str(d["режим"]))),
+        "",
+        "🌍 СЕССИЯ",
+        _line("Сессия", d["сессия"]),
+        _line("Фаза", d["фаза"]),
+        _line("До конца сессии", d["до_конца"]),
+        _line("Вход", "✅ Разрешён" if d["вход_разрешён"] else "❌ Запрещён"),
+        "",
+        "🔗 ПОДКЛЮЧЕНИЕ",
+        _line("Подключено пар", str(d["всего_пар"])),
+        _line("Лимит пар", str(d["лимит_пар"])),
+    ]
+    return _pre(lines)
+
+
+def _build_scanner_text() -> str:
+    d = _get_status_data()
+    lines = [
+        "🔭 СКАНЕР",
+        "────────────────────────",
+        _line("Пресет", d["режим_сканера"]),
+        _line("Лимит пар", str(d["лимит_пар"])),
+        _line("Всего пар", str(d["всего_пар"])),
+        _line("После ликв.", str(d["после_ликв"])),
+        _line("После волат.", str(d["после_вол"])),
+        _line("После структуры", str(d["после_структ"])),
+        _line("Кандидатов", str(d["кандидаты"])),
+        _line("Сигналов", str(d["сигналы"])),
+        _line("Лучший балл", str(d["лучший_балл"])),
+        _line("Последний отказ", str(d["последний_отказ"])),
+    ]
+    return _pre(lines)
+
+
+def _build_positions_text() -> str:
+    if not _db_exists():
+        return _pre(["📍 ПОЗИЦИИ", "", "База не найдена."])
+
+    try:
+        conn = _db()
+        rows = conn.execute(
+            """
+            SELECT
+                symbol,
+                direction,
+                entry,
+                sl,
+                tp1,
+                tp2,
+                tp3,
+                size,
+                leverage,
+                opened_at
+            FROM APEX_MASTER_TRADE
+            WHERE row_status = 'active'
+              AND mode_layer IN ('AUTO','MANUAL')
+            ORDER BY id DESC
+            LIMIT 5
+            """
+        ).fetchall()
+
+        cnt_row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM APEX_MASTER_TRADE
+            WHERE row_status = 'active'
+              AND mode_layer IN ('AUTO','MANUAL')
+            """
+        ).fetchone()
+        total_open = _safe_int(cnt_row["cnt"] if cnt_row else 0, 0)
+        conn.close()
+
+        if not rows:
+            return _pre(["📍 ПОЗИЦИИ", "", "Открытых позиций нет."])
+
+        lines = [
+            "📍 ПОЗИЦИИ",
+            "",
+            _line("Открыто сейчас", str(total_open)),
+            _line("Показано", str(len(rows))),
+        ]
+
+        for i, row in enumerate(rows, start=1):
+            direction = "ЛОНГ" if str(row["direction"]).lower() == "long" else "ШОРТ"
+            lines.extend([
+                "",
+                f"{i}. {row['symbol']} [{direction}]",
+                _line("Вход", str(row["entry"])),
+                _line("Стоп-лосс", str(row["sl"])),
+                _line("TP1/TP2/TP3", f"{row['tp1']} / {row['tp2']} / {row['tp3']}"),
+                _line("Размер / Плечо", f"{row['size']} / x{row['leverage']}"),
+                _line("Открыта", _fmt_dt(row["opened_at"])),
+            ])
+
+        if total_open > len(rows):
+            lines.extend(["", _line("Ещё позиций", str(total_open - len(rows)))])
+
+        return _pre(lines)
+
+    except Exception as e:
+        return _pre(["📍 ПОЗИЦИИ", "", f"Ошибка чтения: {e}"])
+
+
+def _build_market_now_text() -> str:
+    d = _get_status_data()
+    lines = [
+        "📈 РЫНОК СЕЙЧАС",
+        "────────────────────────",
+        _line("Сессия", d["сессия"]),
+        _line("Фаза", d["фаза"]),
+        _line("До конца", d["до_конца"]),
+        _line("Всего пар", str(d["всего_пар"])),
+        _line("После ликв.", str(d["после_ликв"])),
+        _line("После волат.", str(d["после_вол"])),
+        _line("После структуры", str(d["после_структ"])),
+        _line("Кандидатов", str(d["кандидаты"])),
+        _line("Сигналов", str(d["сигналы"])),
+        _line("Лучший балл", str(d["лучший_балл"])),
+        _line("Отказ", str(d["последний_отказ"])),
+    ]
+    return _pre(lines)
+
+
+def _build_results_text() -> str:
+    d = _get_status_data()
+    lines = [
+        "💼 ИТОГИ ДНЯ",
+        "────────────────────────",
+        "🤖 Авто-торговля",
+        _line("Сделки", str(d["auto_trades"])),
+        _line("PnL", f"{d['auto_pnl']} USDT"),
+        _line("W/L/BE", f"{d['auto_wins']} / {d['auto_losses']} / {d['auto_be']}"),
+        _line("WinRate", d["auto_wr"]),
+        "",
+        "✋ Ручной режим",
+        _line("Сделки", str(d["manual_trades"])),
+        _line("PnL", f"{d['manual_pnl']} USDT"),
+        _line("W/L/BE", f"{d['manual_wins']} / {d['manual_losses']} / {d['manual_be']}"),
+        _line("WinRate", d["manual_wr"]),
+        "",
+        "💵 ИТОГО",
+        _line("Баланс", f"{d['баланс']} USDT"),
+        _line("Средства", f"{d['средства']} USDT"),
+        _line("Прибыль сегодня", f"{d['прибыль_сегодня']} USDT"),
+        _line("Открыто позиций", str(d["открыто"])),
+        _line("Последняя сделка", d["последняя_сделка"]),
+    ]
+    return _pre(lines)
+
+
+def _build_session_text() -> str:
+    d = _get_status_data()
+    lines = [
+        "📊 СЕССИЯ",
+        "────────────────────────",
+        _line("Сессия", d["сессия"]),
+        _line("Фаза", d["фаза"]),
+        _line("До конца", d["до_конца"]),
+        _line("Вход", "Разрешён" if d["вход_разрешён"] else "Запрещён"),
+        _line("Кандидатов", str(d["кандидаты"])),
+        _line("Сигналов", str(d["сигналы"])),
+        _line("Открыто позиций", str(d["открыто"])),
+        "",
+        "🤖 Авто-торговля",
+        _line("Сделки", str(d["auto_trades"])),
+        _line("PnL", f"{d['auto_pnl']} USDT"),
+        "",
+        "✋ Ручной режим",
+        _line("Сделки", str(d["manual_trades"])),
+        _line("PnL", f"{d['manual_pnl']} USDT"),
+    ]
+    return _pre(lines)
+
+
+def _build_settings_text() -> str:
+    d = _get_status_data()
+    lines = [
+        "⚙️ НАСТРОЙКА БОТА",
+        "────────────────────────",
+        _line("Стратегия", d["стратегия"]),
+        _line("Направление", str(d["направление"])),
+        _line("Стоп-лосс", f"{d['sl']}%"),
+        _line("TP1", f"{d['tp1']}%"),
+        _line("TP2", f"{d['tp2']}%"),
+        _line("TP3", f"{d['tp3']}%"),
+        _line("Плечо", f"x{d['плечо']}"),
+        _line("Размер USDT", str(d["размер"])),
+        _line("Риск/сделка", f"{d['риск']} USDT" if d["риск"] != "выкл" else "выкл"),
+        _line("Лимит позиций", str(d["лимит_позиций"])),
+    ]
+    return _pre(lines)
+
+
+# ============================================================
+# START
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _set_menu(context, "main")
+    await update.message.reply_text(
+        "⚡ <b>APEX PROTOCOL™</b>\nСистема готова.",
+        parse_mode="HTML",
+        reply_markup=main_menu(),
+    )
+
+
+# ============================================================
+# ГЛАВНЫЙ ОБРАБОТЧИК
+# ============================================================
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    text = update.message.text.strip()
+    logger.info("telegram text=%r", text)
+
+    if text == "◀️ Назад":
+        current = context.user_data.get("menu", "main")
+        parent = _parent_menu(current)
+        _set_menu(context, parent)
+
+        title = {
+            "main": "Главное меню",
+            "status": "Раздел статуса",
+            "scanner": "Раздел сканера",
+            "scanner_mode": "Выбор пресета сканера",
+            "scanner_pairs": "Лимит пар сканера",
+            "scanner_filters": "Фильтры сканера",
+            "wau": "Аналитика",
+            "settings": "Настройка бота",
+            "auto": "Авторежим",
+            "limits": "Лимиты",
+            "exchange": "Биржи",
+            "strategy": "Выбор стратегии",
+            "confirm_stop": "Подтверждение остановки",
+        }.get(parent, "Главное меню")
+
+        await update.message.reply_text(
+            f"◀️ <b>{title}</b>",
+            parse_mode="HTML",
+            reply_markup=_menu_markup(parent),
+        )
+        return
+
+    if text == "📊 Статус":
+        _set_menu(context, "status")
+        await update.message.reply_text(
+            "📊 <b>РАЗДЕЛ СТАТУСА</b>\nВыбери подраздел:",
+            parse_mode="HTML",
+            reply_markup=status_menu(),
+        )
+        return
+
+    if text == "💰 Торговля":
+        _set_menu(context, "status")
+        await update.message.reply_text(
+            _build_trading_text(),
+            parse_mode="HTML",
+            reply_markup=status_menu(),
+        )
+        return
+
+    if text == "🛠 Состояние":
+        _set_menu(context, "status")
+        await update.message.reply_text(
+            _build_system_text(),
+            parse_mode="HTML",
+            reply_markup=status_menu(),
+        )
+        return
+
+    if text == "🔭 Сканер":
+        _set_menu(context, "scanner")
+        await update.message.reply_text(
+            "🔭 <b>РАЗДЕЛ СКАНЕРА</b>\nВыбери подраздел:",
+            parse_mode="HTML",
+            reply_markup=scanner_menu(),
+        )
+        return
+
+    if text == "📡 Статус сканера":
+        _set_menu(context, "scanner")
+        await update.message.reply_text(
+            _build_scanner_text(),
+            parse_mode="HTML",
+            reply_markup=scanner_menu(),
+        )
+        return
+
+    if text == "⚙️ Пресеты":
+        _set_menu(context, "scanner_mode")
+        await update.message.reply_text(
+            "⚙️ <b>ВЫБОР ПРЕСЕТА СКАНЕРА</b>",
+            parse_mode="HTML",
+            reply_markup=scanner_mode_menu(),
+        )
+        return
+
+    if text == "🔢 Лимит пар":
+        _set_menu(context, "scanner_pairs")
+        await update.message.reply_text(
+            "🔢 <b>ВЫБЕРИ ЛИМИТ ПАР</b>",
+            parse_mode="HTML",
+            reply_markup=scanner_pairs_menu(),
+        )
+        return
+
+    if text == "🧩 Фильтры":
+        _set_menu(context, "scanner_filters")
+        await update.message.reply_text(
+            "🧩 <b>ФИЛЬТРЫ СКАНЕРА</b>",
+            parse_mode="HTML",
+            reply_markup=scanner_filters_menu(),
+        )
+        return
+
+    if text == "🟢 Пресет А":
+        _write_test_control({
+            "scanner_mode_label": "Пресет А",
+            "scanner_pairs_limit": 20,
+        })
+        _set_menu(context, "scanner_mode")
+        await update.message.reply_text(
+            "🟢 <b>Выбран Пресет А</b>\nЛимит пар: <b>20</b>",
+            parse_mode="HTML",
+            reply_markup=scanner_mode_menu(),
+        )
+        return
+
+    if text == "🟡 Пресет Б":
+        _write_test_control({
+            "scanner_mode_label": "Пресет Б",
+            "scanner_pairs_limit": 100,
+        })
+        _set_menu(context, "scanner_mode")
+        await update.message.reply_text(
+            "🟡 <b>Выбран Пресет Б</b>\nЛимит пар: <b>100</b>",
+            parse_mode="HTML",
+            reply_markup=scanner_mode_menu(),
+        )
+        return
+
+    if text == "🔴 Пресет В":
+        _write_test_control({
+            "scanner_mode_label": "Пресет В",
+            "scanner_pairs_limit": 500,
+        })
+        _set_menu(context, "scanner_mode")
+        await update.message.reply_text(
+            "🔴 <b>Выбран Пресет В</b>\nЛимит пар: <b>500</b>",
+            parse_mode="HTML",
+            reply_markup=scanner_mode_menu(),
+        )
+        return
+
+    if text == "✍️ Ручной режим":
+        _write_test_control({
+            "scanner_mode_label": "Ручной",
+        })
+        _set_menu(context, "scanner_pairs")
+        await update.message.reply_text(
+            "✍️ <b>Ручной режим</b>\nТеперь выбери лимит пар.",
+            parse_mode="HTML",
+            reply_markup=scanner_pairs_menu(),
+        )
+        return
+
+    if text in {"10 пар", "20 пар", "100 пар", "500 пар"}:
+        limit = int(text.split()[0])
+        _write_test_control({
+            "scanner_pairs_limit": limit,
+            "scanner_mode_label": "Ручной",
+        })
+        _set_menu(context, "scanner_pairs")
+        await update.message.reply_text(
+            f"🔢 <b>Лимит пар установлен: {limit}</b>",
+            parse_mode="HTML",
+            reply_markup=scanner_pairs_menu(),
+        )
+        return
+
+    if text in {"Фильтр ликв.", "Фильтр волат.", "Фильтр структуры", "Фильтр объёма"}:
+        _set_menu(context, "scanner_filters")
+        await update.message.reply_text(
+            f"🧩 <b>{text}</b>\nПока не подключено.",
+            parse_mode="HTML",
+            reply_markup=scanner_filters_menu(),
+        )
+        return
+
+    if text == "⚡ ВАУ+":
+        _set_menu(context, "wau")
+        await update.message.reply_text(
+            "⚡ <b>АНАЛИТИКА</b>",
+            parse_mode="HTML",
+            reply_markup=wau_menu(),
+        )
+        return
+
+    if text == "📈 Рынок сейчас":
+        _set_menu(context, "wau")
+        await update.message.reply_text(
+            _build_market_now_text(),
+            parse_mode="HTML",
+            reply_markup=wau_menu(),
+        )
+        return
+
+    if text == "📊 Сессия":
+        _set_menu(context, "wau")
+        await update.message.reply_text(
+            _build_session_text(),
+            parse_mode="HTML",
+            reply_markup=wau_menu(),
+        )
+        return
+
+    if text == "💼 Итоги дня":
+        _set_menu(context, "wau")
+        await update.message.reply_text(
+            _build_results_text(),
+            parse_mode="HTML",
+            reply_markup=wau_menu(),
+        )
+        return
+
+    if text == "🧠 AI (скоро)":
+        _set_menu(context, "wau")
+        await update.message.reply_text(
+            "🧠 <b>Модуль AI пока не подключён</b>\nПозже здесь будет анализ рынка.",
+            parse_mode="HTML",
+            reply_markup=wau_menu(),
+        )
+        return
+
+    if text == "🟢 Старт":
+        _set_menu(context, "strategy")
+        await update.message.reply_text(
+            "🟢 <b>ВЫБОР СТРАТЕГИИ</b>",
+            parse_mode="HTML",
+            reply_markup=strategy_menu(),
+        )
+        return
+
+    if text == "TOP20 1M BREAKOUT":
+        state = _write_test_control({
+            "trading_enabled": True,
+            "scanner_enabled": True,
+            "entries_enabled": True,
+            "monitor_enabled": True,
+            "manual_entry_enabled": True,
+            "active_filter": "TOP20_1M_BREAKOUT_v1",
+            "strategy_mode": "RUN_MODE",
+            "mode": "RUN",
+        })
+        _set_menu(context, "main")
+        await update.message.reply_text(
+            "🟢 <b>СТРАТЕГИЯ ВЫБРАНА</b>\n"
+            "Стратегия: <b>TOP20_1M_BREAKOUT_v1</b>\n"
+            f"Обновлено: <b>{state.get('updated_at', 'n/a')}</b>",
+            parse_mode="HTML",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if text == "(будущая стратегия)":
+        _set_menu(context, "strategy")
+        await update.message.reply_text(
+            "🧠 <b>Будущая стратегия</b>\nПока не подключено.",
+            parse_mode="HTML",
+            reply_markup=strategy_menu(),
+        )
+        return
+
+    if text == "🔴 Стоп":
+        _set_menu(context, "confirm_stop")
+        await update.message.reply_text(
+            "🔴 <b>Подтверди остановку торговли</b>",
+            parse_mode="HTML",
+            reply_markup=confirm_stop_menu(),
+        )
+        return
+
+    if text == "✅ Да, остановить":
+        state = _write_test_control({
+            "trading_enabled": False,
+            "scanner_enabled": False,
+            "entries_enabled": False,
+            "monitor_enabled": False,
+            "manual_entry_enabled": False,
+            "mode": "STOP",
+        })
+        _set_menu(context, "main")
+        await update.message.reply_text(
+            "🔴 <b>ТОРГОВЛЯ ОСТАНОВЛЕНА</b>\n"
+            f"Обновлено: <b>{state.get('updated_at', 'n/a')}</b>",
+            parse_mode="HTML",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if text == "❌ Отмена":
+        _set_menu(context, "main")
+        await update.message.reply_text(
+            "❌ <b>Отмена</b>",
+            parse_mode="HTML",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if text == "📍 Позиции":
+        _set_menu(context, "main")
+        await update.message.reply_text(
+            _build_positions_text(),
+            parse_mode="HTML",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if text == "♻️ Сброс":
+        _write_test_control({
+            "test_balance": 5000.0,
+            "manual_topup_total": 0.0,
+            "awaiting_param_input": None,
+            "awaiting_reset_confirm": False,
+            "awaiting_stop_confirm": False,
+        })
+        _set_menu(context, "main")
+        await update.message.reply_text(
+            "♻️ <b>Сброшено только состояние Telegram и test_control</b>\n"
+            "Торговые таблицы не затронуты.",
+            parse_mode="HTML",
+            reply_markup=main_menu(),
+        )
+        return
+
+    if text == "⚙️ Настройка бота":
+        _set_menu(context, "settings")
+        await update.message.reply_text(
+            _build_settings_text(),
+            parse_mode="HTML",
+            reply_markup=settings_menu(),
+        )
+        return
+
+    if text == "🎯 TP1":
+        tc = _get_test_control()
+        context.user_data["awaiting_param"] = "param_tp1_pct"
+        _set_menu(context, "settings")
+        await update.message.reply_text(
+            f"🎯 <b>TP1</b>\nТекущее значение: <b>{tc.get('param_tp1_pct', 1.0)}%</b>\n\nВведи новое значение в %:",
+            parse_mode="HTML", reply_markup=settings_menu())
+        return
+
+    if text == "🎯 TP2":
+        tc = _get_test_control()
+        context.user_data["awaiting_param"] = "param_tp2_pct"
+        _set_menu(context, "settings")
+        await update.message.reply_text(
+            f"🎯 <b>TP2</b>\nТекущее значение: <b>{tc.get('param_tp2_pct', 2.0)}%</b>\n\nВведи новое значение в %:",
+            parse_mode="HTML", reply_markup=settings_menu())
+        return
+
+    if text == "🎯 TP3":
+        tc = _get_test_control()
+        context.user_data["awaiting_param"] = "param_tp3_pct"
+        _set_menu(context, "settings")
+        await update.message.reply_text(
+            f"🎯 <b>TP3</b>\nТекущее значение: <b>{tc.get('param_tp3_pct', 3.0)}%</b>\n\nВведи новое значение в %:",
+            parse_mode="HTML", reply_markup=settings_menu())
+        return
+
+    if text == "⚡ Плечо":
+        tc = _get_test_control()
+        context.user_data["awaiting_param"] = "param_leverage"
+        _set_menu(context, "settings")
+        await update.message.reply_text(
+            f"⚡ <b>Плечо</b>\nТекущее значение: <b>{tc.get('param_leverage', 20)}x</b>\n\nВведи новое значение (число):",
+            parse_mode="HTML", reply_markup=settings_menu())
+        return
+
+    if text == "➕ Позиция":
+        tc = _get_test_control()
+        current = float(tc.get("param_size_usdt", 500))
+        new_val = round(current + 100, 2)
+        _write_test_control({"param_size_usdt": new_val})
+        _set_menu(context, "settings")
+        await update.message.reply_text(
+            f"➕ <b>Позиция увеличена</b>\n{current} → <b>{new_val} USDT</b>",
+            parse_mode="HTML", reply_markup=settings_menu())
+        return
+
+    if text == "➖ Позиция":
+        tc = _get_test_control()
+        current = float(tc.get("param_size_usdt", 500))
+        new_val = max(100, round(current - 100, 2))
+        _write_test_control({"param_size_usdt": new_val})
+        _set_menu(context, "settings")
+        await update.message.reply_text(
+            f"➖ <b>Позиция уменьшена</b>\n{current} → <b>{new_val} USDT</b>",
+            parse_mode="HTML", reply_markup=settings_menu())
+        return
+
+    if text == "🧠 Авторежим":
+        _set_menu(context, "auto")
+        await update.message.reply_text("🧠 <b>АВТОРЕЖИМ</b>", parse_mode="HTML", reply_markup=auto_menu())
+        return
+
+    if text in {"Защита 1", "Защита 2", "Защита 3", "Трейлинг", "Выход по времени"}:
+        _set_menu(context, "auto")
+        await update.message.reply_text(f"🧠 <b>{text}</b>\nПока не подключено.", parse_mode="HTML", reply_markup=auto_menu())
+        return
+
+    if text == "📉 Лимиты":
+        _set_menu(context, "limits")
+        await update.message.reply_text("📉 <b>ЛИМИТЫ</b>", parse_mode="HTML", reply_markup=limits_menu())
+        return
+
+    if text in {"Макс. позиций", "Кулдаун", "Макс. сделок / сессия"}:
+        _set_menu(context, "limits")
+        await update.message.reply_text(f"📉 <b>{text}</b>\nПока не подключено.", parse_mode="HTML", reply_markup=limits_menu())
+        return
+
+    if text == "💰 Биржи":
+        _set_menu(context, "exchange")
+        await update.message.reply_text("💰 <b>БИРЖИ / ЖИВЫЕ ДЕНЬГИ</b>", parse_mode="HTML", reply_markup=exchange_menu())
+        return
+
+    if text in {"Binance", "Bybit", "OKX"}:
+        _set_menu(context, "exchange")
+        await update.message.reply_text(f"💰 <b>{text}</b>\nСтатус: <b>не подключено</b>", parse_mode="HTML", reply_markup=exchange_menu())
+        return
+
+    if text == "🔌 Подключить":
+        _set_menu(context, "exchange")
+        await update.message.reply_text("🔌 <b>Подключение API</b>\nПока не подключено.", parse_mode="HTML", reply_markup=exchange_menu())
+        return
+
+    if text == "📊 Статус бирж":
+        _set_menu(context, "exchange")
+        await update.message.reply_text(
+            "📊 <b>СТАТУС БИРЖ</b>\n"
+            "Binance: <b>ВЫКЛ</b>\n"
+            "Bybit: <b>ВЫКЛ</b>\n"
+            "OKX: <b>ВЫКЛ</b>",
+            parse_mode="HTML",
+            reply_markup=exchange_menu(),
+        )
+        return
+
+    awaiting = context.user_data.get("awaiting_param")
+    if awaiting:
+        try:
+            value = float(text.replace(",", "."))
+            _write_test_control({awaiting: value})
+            context.user_data.pop("awaiting_param", None)
+            labels = {
+                "param_tp1_pct": "TP1",
+                "param_tp2_pct": "TP2",
+                "param_tp3_pct": "TP3",
+                "param_leverage": "Плечо",
+            }
+            label = labels.get(awaiting, awaiting)
+            await update.message.reply_text(
+                f"✅ <b>{label} установлен: {value}</b>",
+                parse_mode="HTML", reply_markup=settings_menu())
+            return
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Введи число. Например: 1.5",
+                parse_mode="HTML", reply_markup=settings_menu())
+            return
+
+    _set_menu(context, "main")
+    await update.message.reply_text(
+        "Не понял команду.\nНажми /start",
+        reply_markup=main_menu(),
+    )

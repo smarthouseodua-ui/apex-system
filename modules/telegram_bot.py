@@ -50,4 +50,4 @@ def run_bot():
     app.add_handler(CommandHandler("stop", stop))
     app.add_handler(CommandHandler("run", start_trading))
 
-    app.run_polling()
+    app.run_polling(poll_interval=60)

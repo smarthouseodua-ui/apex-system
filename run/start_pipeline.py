@@ -6,6 +6,7 @@ APEX PROTOCOL™ — Start Pipeline
 import asyncio
 import logging
 import yaml
+import json
 import os
 import sys
 
@@ -30,6 +31,13 @@ def load_config() -> dict:
         with open(path, "r") as f:
             data = yaml.safe_load(f)
             config.update(data)
+
+    extra_json = "/root/apex-system/config.json"
+    if os.path.exists(extra_json):
+        with open(extra_json, "r") as f:
+            extra_data = json.load(f)
+            config.update(extra_data)
+
     config["mode"] = "simulation"
     return config
 

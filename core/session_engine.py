@@ -1,20 +1,23 @@
 """
 APEX PROTOCOL™ — Session Engine
 Единый источник логики сессий для бота, API и Deboshore.
-Все времена в UTC.
+Все времена в Europe/Podgorica (CET/CEST — DST автоматически).
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+TZ_PG = ZoneInfo("Europe/Podgorica")
 
 # ─────────────────────────────────────────────
-# СЕКЦИЯ 1 — КОНФИГ СЕССИЙ (UTC)
+# СЕКЦИЯ 1 — КОНФИГ СЕССИЙ (Europe/Podgorica)
 # ─────────────────────────────────────────────
 
 SESSIONS = {
-    "TOKYO":     {"open": "00:00", "no_watch": True},
-    "HONG_KONG": {"open": "01:30"},
-    "LONDON":    {"open": "07:00"},
-    "NEW_YORK":  {"open": "13:30"},
+    "TOKYO":     {"open": "01:00", "no_watch": True},
+    "HONG_KONG": {"open": "02:30"},
+    "LONDON":    {"open": "08:00"},
+    "NEW_YORK":  {"open": "14:30"},
 }
 
 SESSION_RU = {
@@ -29,33 +32,8 @@ SESSION_RU = {
 # ТЕСТ-БЛОК — удалить после тестирования
 # ─────────────────────────────────────────────
 SESSIONS_TEST = {
-    "TEST_1": {"open": "10:30"},  # 11:30 CET
-    "TEST_2": {"open": "16:00"},  # 17:00 CET
-    "TEST_3": {"open": "05:00"},  # 06:00 CET
 }
 SESSION_RU_TEST = {
-    "TEST_1": "Тест 1 (12:00)",
-    "TEST_2": "Тест 2 (17:30)",
-    "TEST_3": "Тест 3 (06:00)",
-}
-_ALL_SESSIONS     = {**SESSIONS,    **SESSIONS_TEST}
-_ALL_SESSIONS_RU  = {**SESSION_RU, **SESSION_RU_TEST}
-# ─────────────────────────────────────────────
-# КОНЕЦ ТЕСТ-БЛОКА
-# ─────────────────────────────────────────────
-
-# ─────────────────────────────────────────────
-# ТЕСТ-БЛОК — удалить после тестирования
-# ─────────────────────────────────────────────
-SESSIONS_TEST = {
-    "TEST_1": {"open": "10:30"},  # 11:30 CET
-    "TEST_2": {"open": "16:00"},  # 17:00 CET
-    "TEST_3": {"open": "05:00"},  # 06:00 CET
-}
-SESSION_RU_TEST = {
-    "TEST_1": "Тест 1 (12:00)",
-    "TEST_2": "Тест 2 (17:30)",
-    "TEST_3": "Тест 3 (06:00)",
 }
 _ALL_SESSIONS    = {**SESSIONS,   **SESSIONS_TEST}
 _ALL_SESSIONS_RU = {**SESSION_RU, **SESSION_RU_TEST}
@@ -63,35 +41,17 @@ _ALL_SESSIONS_RU = {**SESSION_RU, **SESSION_RU_TEST}
 # КОНЕЦ ТЕСТ-БЛОКА
 # ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-# ТЕСТ-БЛОК — удалить после тестирования
-# ─────────────────────────────────────────────
-SESSIONS_TEST = {
-    "TEST_1": {"open": "10:30"},  # 11:30 CET
-    "TEST_2": {"open": "16:00"},  # 17:00 CET
-    "TEST_3": {"open": "05:00"},  # 06:00 CET
-}
-SESSION_RU_TEST = {
-    "TEST_1": "Тест 1 (12:00)",
-    "TEST_2": "Тест 2 (17:30)",
-    "TEST_3": "Тест 3 (06:00)",
-}
-_ALL_SESSIONS    = {**SESSIONS,   **SESSIONS_TEST}
-_ALL_SESSIONS_RU = {**SESSION_RU, **SESSION_RU_TEST}
-# ─────────────────────────────────────────────
-# КОНЕЦ ТЕСТ-БЛОКА
-# ─────────────────────────────────────────────
 # ─────────────────────────────────────────────
 # СЕКЦИЯ 2 — УТИЛИТЫ ВРЕМЕНИ
 # ─────────────────────────────────────────────
 
-def _parse_time_utc(time_str):
+def _parse_time(time_str):
     h, m = map(int, time_str.split(":"))
     return h, m
 
 
-def _today_utc_datetime(h, m):
-    now = datetime.now(timezone.utc)
+def _today_pg_datetime(h, m):
+    now = datetime.now(TZ_PG)
     return now.replace(hour=h, minute=m, second=0, microsecond=0)
 
 
@@ -103,10 +63,9 @@ def _minutes_between(a, b):
 # ─────────────────────────────────────────────
 
 def _detect_phase(now, open_dt):
-    pre_start  = open_dt - timedelta(minutes=30)
-    entry_end  = open_dt + timedelta(minutes=90)   # ENTRY: первые 90 мин
-    active_end = open_dt + timedelta(minutes=120)  # WATCH: 90-120 мин
-    late_end   = open_dt + timedelta(minutes=120)  # совпадает с active_end
+    pre_start   = open_dt - timedelta(minutes=30)
+    entry_end   = open_dt + timedelta(minutes=90)    # ВХОД: 0-90 мин
+    watch_end   = entry_end + timedelta(minutes=30)   # СОПРОВОЖДЕНИЕ: 90-120 мин
 
     if now < pre_start:
         return "ОЖИДАНИЕ"
@@ -114,10 +73,8 @@ def _detect_phase(now, open_dt):
         return "ПОДГОТОВКА"
     elif now < entry_end:
         return "ВХОД"
-    elif now < active_end:
+    elif now < watch_end:
         return "СОПРОВОЖДЕНИЕ"
-    elif now < late_end:
-        return "ПОЗДНЯЯ ФАЗА"
     else:
         return "СЕССИЯ ЗАКРЫТА"
 
@@ -133,8 +90,6 @@ def _build_hint(phase, mins_to_open=None, mins_to_close=None):
     if phase == "ВХОД":
         return "Активная фаза входа в рынок"
     if phase == "СОПРОВОЖДЕНИЕ":
-        return "Фаза сопровождения. Новые входы нежелательны"
-    if phase == "ПОЗДНЯЯ ФАЗА":
         return f"До завершения сессии осталось {mins_to_close} мин. Контроль и закрытие"
     if phase == "СЕССИЯ ЗАКРЫТА":
         return "Сессия завершена"
@@ -146,17 +101,16 @@ def _build_hint(phase, mins_to_open=None, mins_to_close=None):
 
 def get_session_state(session_name):
     """Возвращает полное состояние одной сессии."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(TZ_PG)
 
-    h, m = _parse_time_utc(_ALL_SESSIONS[session_name]["open"])
-    open_dt = _today_utc_datetime(h, m)
+    h, m = _parse_time(_ALL_SESSIONS[session_name]["open"])
+    open_dt = _today_pg_datetime(h, m)
 
     phase = _detect_phase(now, open_dt)
 
     pre_start  = open_dt - timedelta(minutes=30)
-    entry_end  = open_dt + timedelta(minutes=90)   # ENTRY: первые 90 мин
-    active_end = open_dt + timedelta(minutes=120)  # WATCH: 90-120 мин
-    late_end   = open_dt + timedelta(minutes=120)  # совпадает с active_end
+    entry_end  = open_dt + timedelta(minutes=90)
+    watch_end  = entry_end + timedelta(minutes=30)
 
     data = {
         "сессия": _ALL_SESSIONS_RU.get(session_name, session_name),
@@ -179,11 +133,7 @@ def get_session_state(session_name):
 
     elif phase == "СОПРОВОЖДЕНИЕ":
         data["прошло_мин"] = _minutes_between(open_dt, now)
-        data["до_60_мин"] = _minutes_between(now, active_end)
-
-    elif phase == "ПОЗДНЯЯ ФАЗА":
-        data["прошло_мин"] = _minutes_between(open_dt, now)
-        data["до_закрытия_мин"] = _minutes_between(now, late_end)
+        data["до_закрытия_мин"] = _minutes_between(now, watch_end)
 
     elif phase == "СЕССИЯ ЗАКРЫТА":
         next_open = open_dt + timedelta(days=1)
@@ -234,6 +184,25 @@ def get_phase_for_orchestrator():
         session_name: "TOKYO" / "HONG_KONG" / "LONDON" / "NEW_YORK" / "OFF"
         raw_phase: русская фаза
     """
+    # ── CLEAN MANUAL TEST WINDOW ───────────────────────────────────────────
+    try:
+        import json
+        now = datetime.now(TZ_PG)
+        tc_path = "/root/apex-system/storage/test_control.json"
+        tc = json.loads(Path(tc_path).read_text(encoding="utf-8"))
+
+        if tc.get("manual_hour_enabled") and tc.get("selected_hour") is not None:
+            selected_hour = int(tc.get("selected_hour"))
+            if now.hour == selected_hour:
+                return "ENTRY", "LONDON", "MANUAL_TEST_HOUR"
+    except Exception:
+        pass
+
+    # ── TEST CONTROL OVERRIDE DISABLED FOR SESSION SYNC ───────────────
+    # Disabled to make orchestrator use only штатная логика сессий.
+    # If needed later, restore from backup.
+
+    # ── ШТАТНАЯ ЛОГИКА ───────────────────────────────────────────────────
     for name in _ALL_SESSIONS:
         state = get_session_state(name)
         phase = state["фаза"]
@@ -241,9 +210,10 @@ def get_phase_for_orchestrator():
             return "PRE_SESSION", name, phase
         elif phase == "ВХОД":
             return "ENTRY", name, phase
-        elif phase in ("СОПРОВОЖДЕНИЕ", "ПОЗДНЯЯ ФАЗА"):
-            # no_watch: сразу OFF (закрыть все позиции)
+        elif phase == "СОПРОВОЖДЕНИЕ":
             if _ALL_SESSIONS.get(name, {}).get("no_watch"):
                 return "OFF", name, phase
             return "WATCH", name, phase
+
     return "OFF", "OFF", "ОЖИДАНИЕ"
+

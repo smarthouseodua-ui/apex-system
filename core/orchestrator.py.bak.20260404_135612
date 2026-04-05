@@ -1,0 +1,1016 @@
+"""
+APEX PROTOCOL™ — Core Orchestrator
+Главный координатор торгового пайплайна.
+
+Сессионная модель (session_engine.py):
+- ВХОД:          0–90 мин сессии — полный pipeline (scan → execute)
+- СОПРОВОЖДЕНИЕ: 90–120 мин — мониторинг и закрытие
+- ПОДГОТОВКА:    за 30 мин до открытия — SMC-анализ
+- OFF:           вне всех сессий — закрыть всё
+
+Ручной override:
+- manual_entry_enabled = true  → игнорировать сессии, всегда ENTRY
+- manual_entry_enabled = false → штатная сессионная логика
+"""
+
+import asyncio
+import logging
+import time
+from datetime import datetime
+from pytz import timezone as tz
+
+PODGORICA = tz("Europe/Podgorica")
+
+from core.state_manager import StateManager
+from core.event_bus import EventBus
+from core.id_manager import IdManager
+from modules.position_monitor import monitor as position_monitor
+from utils.fee_utils import get_fee_rate
+
+logger = logging.getLogger("apex.orchestrator")
+
+
+class Orchestrator:
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.running = False
+
+        self.state_manager = StateManager()
+        self.event_bus = EventBus()
+        self.id_manager = IdManager()
+
+        self.scanner = None
+        self.strategy_engine = None
+        self.signal_gate = None
+        self.risk_manager = None
+        self.execution_engine = None
+        self.position_manager = None
+        self.finalizer = None
+
+        self._open_positions: dict[str, dict] = {}
+        self._pre_session_done = {}
+
+        self.breakout_strategy = None
+        self._breakout_active = False
+        self._last_smc_at = None
+
+        logger.info("Orchestrator initialized")
+
+    async def setup(self):
+        from modules.scanner import Scanner
+        from modules.strategy_engine import StrategyEngine
+        from modules.signal_gate import SignalGate
+        from modules.position_manager import PositionManager
+        from modules.finalizer import Finalizer
+        from modules.pre_session_smc import PreSessionAnalyzer
+        from storage.db.repository import Repository
+
+        self.scanner = Scanner(self.config, self.event_bus)
+        self.strategy_engine = StrategyEngine(self.config, self.event_bus)
+        self.signal_gate = SignalGate(self.config, self.event_bus)
+        self.position_manager = PositionManager(self.config, self.event_bus)
+        self.finalizer = Finalizer(self.config, self.event_bus)
+
+        self._repo = Repository()
+        self.pre_session = PreSessionAnalyzer(
+            self.config,
+            self.scanner.exchange_service,
+            self._repo
+        )
+
+        logger.info("All modules initialized")
+        # SYS_system_registry — регистрация компонентов при старте
+        try:
+            from datetime import datetime as _dt
+            _now = _dt.utcnow().isoformat()
+            _components = [
+                ("apex-pipeline",    "PIPELINE",  "orchestrator",      "online", "Core 02", None, "1.0", "APEX"),
+                ("apex-scanner",     "MODULE",    "scanner",           "online", "Core 02", None, "1.0", "APEX"),
+                ("apex-strategy",    "MODULE",    "strategy_engine",   "online", "Core 02", None, "1.0", "APEX"),
+                ("apex-signal-gate", "MODULE",    "signal_gate",       "online", "Core 02", None, "1.0", "APEX"),
+                ("apex-position-mgr","MODULE",    "position_manager",  "online", "Core 02", None, "1.0", "APEX"),
+                ("apex-finalizer",   "MODULE",    "finalizer",         "online", "Core 02", None, "1.0", "APEX"),
+                ("apex-bot",         "TELEGRAM",  "apps-system-bot",   "online", "Core 02", None, "1.0", "APEX"),
+            ]
+            for name, stype, module, status, host, port, version, owner in _components:
+                self._repo.conn.execute("""
+                    INSERT INTO SYS_system_registry
+                    (system_name, system_type, module_name, status, host, port, version, owner, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(system_name) DO UPDATE SET
+                    status=excluded.status, updated_at=excluded.updated_at
+                """, (name, stype, module, status, host, port, version, owner, _now, _now))
+            self._repo.conn.commit()
+            logger.info("SYS_system_registry: registered " + str(len(_components)) + " components")
+        except Exception as _e:
+            logger.warning(f"SYS_system_registry write failed: {_e}")
+
+    async def _load_open_positions(self):
+        try:
+            from storage.db.repository import Repository
+            repo = Repository()
+            positions = repo.get_open_positions()
+            for p in positions:
+                self._open_positions[p["symbol"]] = p
+
+            if positions:
+                logger.info(
+                    f"Restored {len(positions)} open positions from DB: "
+                    f"{[p['symbol'] for p in positions]}"
+                )
+            else:
+                logger.info("No open positions in DB to restore")
+        except Exception as e:
+            logger.error(f"_load_open_positions error: {e}", exc_info=True)
+
+    def _restore_ee_mon_from_db(self):
+        """Restore EE and MON in-memory dicts from orchestrator's DB-loaded positions."""
+        from modules.execution_engine import OPEN_POSITIONS as EE_POS
+        from modules.position_monitor import OPEN_POSITIONS as MON_POS
+
+        if not self._open_positions:
+            logger.info("[OPEN_POS_RESTORE] No positions to restore — skipping")
+            return
+
+        restored = 0
+        skipped = 0
+        logger.info(
+            f"[OPEN_POS_RESTORE_START] Restoring {len(self._open_positions)} positions into EE/MON"
+        )
+
+        for symbol, pos in self._open_positions.items():
+            if symbol in EE_POS or symbol in MON_POS:
+                skipped += 1
+                continue
+
+            direction = str(pos.get("direction", "long")).lower()
+            side = "SHORT" if direction == "short" else "LONG"
+
+            entry = float(pos.get("entry") or pos.get("fill_price") or 0)
+
+            restored_pos = {
+                **pos,
+                "symbol": symbol,
+                "side": side,
+                "direction": direction,
+                "entry": entry,
+                "entry_price": entry,
+                "fill_price": entry,
+                "current_price": entry,
+                "status": "open",
+                "size_usdt": pos.get("size_usdt") or pos.get("risk_usdt"),
+                "notional": pos.get("notional") or pos.get("risk_usdt"),
+            }
+
+            EE_POS[symbol] = restored_pos
+            MON_POS[symbol] = {
+                **restored_pos,
+                "opened_at": pos.get("opened_at", datetime.now(PODGORICA)),
+            }
+
+            logger.info(
+                f"[OPEN_POS_RESTORE_ITEM] {symbol} side={side} entry={entry} "
+                f"trade_id={pos.get('trade_id')}"
+            )
+            restored += 1
+
+        logger.info(
+            f"[OPEN_POS_RESTORE_DONE] restored={restored} skipped={skipped} "
+            f"EE={len(EE_POS)} MON={len(MON_POS)} ORCH={len(self._open_positions)}"
+        )
+
+    def _sync_orchestrator_positions(self):
+        """Sync orchestrator's _open_positions with DB (row_status='active', by trade_id)."""
+        try:
+            active_trade_ids = self._repo.get_active_trade_ids()
+            active_symbols = self._repo.get_open_symbols()
+
+            stale = []
+            for sym, pos in self._open_positions.items():
+                tid = pos.get("trade_id") if isinstance(pos, dict) else None
+                if tid:
+                    if tid not in active_trade_ids:
+                        stale.append(sym)
+                else:
+                    if sym not in active_symbols:
+                        stale.append(sym)
+
+            for s in stale:
+                pos = self._open_positions.pop(s, None)
+                tid = pos.get("trade_id") if pos else None
+                logger.info(f"[SYNC] removing stale orchestrator position: {s} trade_id={tid}")
+                try:
+                    self._repo.log_system_event(
+                        event="OPEN_POS_SYNC_REMOVE",
+                        module="orchestrator",
+                        message=f"Removed stale orch position: {s} trade_id={tid}",
+                        level="WARNING",
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.error(f"_sync_orchestrator_positions error: {e}")
+
+    def _log_health(self):
+        """Log HEALTH line across all 3 dicts + DB."""
+        try:
+            from modules.execution_engine import OPEN_POSITIONS as EE_POS, log_health
+            from modules.position_monitor import OPEN_POSITIONS as MON_POS
+            db_active = len(self._repo.get_active_trade_ids())
+            log_health(len(EE_POS), len(MON_POS), len(self._open_positions), db_active)
+        except Exception as e:
+            logger.error(f"_log_health error: {e}")
+
+    def _log_health_pre_sync(self):
+        """Диагностика ДО sync — снимок рассинхрона."""
+        try:
+            from modules.execution_engine import OPEN_POSITIONS as EE_POS, log_health_pre_sync
+            from modules.position_monitor import OPEN_POSITIONS as MON_POS
+            db_active = len(self._repo.get_active_trade_ids())
+            log_health_pre_sync(len(EE_POS), len(MON_POS), len(self._open_positions), db_active)
+        except Exception as e:
+            logger.error(f"_log_health_pre_sync error: {e}")
+
+    def _log_health_post_sync(self):
+        """Диагностика ПОСЛЕ полного sync всех контуров."""
+        try:
+            from modules.execution_engine import OPEN_POSITIONS as EE_POS, log_health_post_sync
+            from modules.position_monitor import OPEN_POSITIONS as MON_POS
+            db_active = len(self._repo.get_active_trade_ids())
+            log_health_post_sync(len(EE_POS), len(MON_POS), len(self._open_positions), db_active)
+        except Exception as e:
+            logger.error(f"_log_health_post_sync error: {e}")
+
+    async def _close_all_session_end(self, reason: str = "SESSION_END"):
+        if not self._open_positions:
+            return
+
+        symbols = list(self._open_positions.keys())
+        for symbol in symbols:
+            pos = self._open_positions.pop(symbol, None)
+            if pos:
+                await self._close_single_position(symbol, pos, reason)
+
+        logger.info(f"{reason}: closed {len(symbols)} positions — {symbols}")
+
+    async def _full_stop_flow(self):
+        """
+        FULL STOP TRANSACTION — атомарный сценарий остановки:
+        1. Закрыть все позиции в памяти orchestrator
+        2. Sweep DB: принудительно закрыть все row_status='active'
+        3. Очистить EE_POS и MON_POS
+        4. Sync и подтвердить 0 active
+        """
+        logger.info("[FULL_STOP] === Phase 1: closing memory positions ===")
+
+        # Phase 1: close all positions in orchestrator memory
+        if self._open_positions:
+            await self._close_all_session_end(reason="MANUAL_STOP")
+
+        # Phase 2: sweep DB — force-close any remaining active trades
+        logger.info("[FULL_STOP] === Phase 2: DB sweep — closing remaining active trades ===")
+        try:
+            await self._stop_sweep_db()
+        except Exception as e:
+            logger.error(f"[FULL_STOP] DB sweep error: {e}", exc_info=True)
+
+        # Phase 3: clear EE and MON in-memory dicts
+        logger.info("[FULL_STOP] === Phase 3: clearing EE/MON memory ===")
+        try:
+            from modules.execution_engine import OPEN_POSITIONS as EE_POS
+            from modules.position_monitor import OPEN_POSITIONS as MON_POS
+            ee_before = len(EE_POS)
+            mon_before = len(MON_POS)
+            EE_POS.clear()
+            MON_POS.clear()
+            logger.info(
+                f"[FULL_STOP] EE cleared: {ee_before}→0, MON cleared: {mon_before}→0"
+            )
+        except Exception as e:
+            logger.error(f"[FULL_STOP] EE/MON clear error: {e}", exc_info=True)
+
+        # Phase 4: final sync and verification
+        logger.info("[FULL_STOP] === Phase 4: final sync & verification ===")
+        try:
+            from modules.execution_engine import sync_open_positions_with_db
+            sync_open_positions_with_db()
+            self._sync_orchestrator_positions()
+        except Exception as e:
+            logger.error(f"[FULL_STOP] sync error: {e}", exc_info=True)
+
+        # Phase 5: verify zero active
+        try:
+            db_active = len(self._repo.get_active_trade_ids())
+            mem_orch = len(self._open_positions)
+            from modules.execution_engine import OPEN_POSITIONS as EE_POS
+            from modules.position_monitor import OPEN_POSITIONS as MON_POS
+            mem_ee = len(EE_POS)
+            mem_mon = len(MON_POS)
+            logger.info(
+                f"[FULL_STOP] VERIFICATION: DB_active={db_active} "
+                f"orch={mem_orch} EE={mem_ee} MON={mem_mon}"
+            )
+            if db_active == 0 and mem_orch == 0:
+                logger.info("[FULL_STOP] ✓ STOP COMPLETE — 0 active positions")
+            else:
+                logger.warning(
+                    f"[FULL_STOP] ✗ STOP INCOMPLETE — "
+                    f"DB_active={db_active} orch={mem_orch}"
+                )
+        except Exception as e:
+            logger.error(f"[FULL_STOP] verification error: {e}", exc_info=True)
+
+        # Phase 6: log health
+        try:
+            self._log_health()
+        except Exception:
+            pass
+
+    async def _stop_sweep_db(self):
+        """Force-close all remaining row_status='active' trades in DB via finalizer."""
+        from storage.db.repository import Repository
+        import sqlite3
+
+        repo = Repository()
+        remaining = repo.get_open_positions()
+
+        if not remaining:
+            logger.info("[FULL_STOP] DB sweep: no remaining active trades")
+            return
+
+        logger.info(f"[FULL_STOP] DB sweep: {len(remaining)} active trades to close")
+
+        for trade in remaining:
+            symbol = trade.get("symbol", "?")
+            trade_id = trade.get("trade_id")
+            try:
+                # Try to get live price from Bybit
+                close_price = None
+                try:
+                    from modules.finalizer import get_price
+                    close_price = get_price(symbol)
+                except Exception as price_err:
+                    logger.warning(
+                        f"[FULL_STOP] price fetch failed for {symbol}: {price_err}"
+                    )
+
+                if close_price:
+                    # Use finalizer's close_trade for full PnL calculation
+                    from modules.finalizer import close_trade
+                    conn = sqlite3.connect(
+                        "/root/apex-system/storage/db/sqlite/apex.db"
+                    )
+                    try:
+                        conn.row_factory = sqlite3.Row
+                        row = conn.execute("""
+                            SELECT trade_id, symbol, direction, entry, fill_price,
+                                   sl, initial_sl, tp1, tp2, tp3, size, risk_usdt, rr,
+                                   opened_at, commission, session_name,
+                                   minutes_to_tp1, minutes_to_sl
+                            FROM APEX_MASTER_TRADE
+                            WHERE trade_id = ? AND row_status = 'active'
+                        """, (trade_id,)).fetchone()
+                        if row:
+                            close_trade(conn, row, close_price, "MANUAL_STOP")
+                            logger.info(
+                                f"[FULL_STOP] finalized {symbol} trade_id={trade_id} "
+                                f"price={close_price}"
+                            )
+                        else:
+                            logger.warning(
+                                f"[FULL_STOP] trade_id={trade_id} not found in DB"
+                            )
+                    finally:
+                        conn.close()
+                else:
+                    # Fallback: close without live price using entry as close_price
+                    entry = float(
+                        trade.get("entry") or trade.get("fill_price") or 0
+                    )
+                    await self._close_single_position(
+                        symbol,
+                        {**trade, "current_price": entry, "trade_id": trade_id},
+                        "MANUAL_STOP",
+                    )
+                    logger.info(
+                        f"[FULL_STOP] fallback-closed {symbol} trade_id={trade_id} "
+                        f"at entry={entry}"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"[FULL_STOP] sweep error for {symbol} "
+                    f"trade_id={trade_id}: {e}",
+                    exc_info=True,
+                )
+
+    def _tc_scanner_enabled(self) -> bool:
+        try:
+            from services.test_control import read as tc_read
+            return tc_read().get("scanner_enabled", True)
+        except Exception:
+            return True
+
+    def _get_phase_and_session(self):
+        """Определяет текущую фазу и сессию.
+
+        Если manual_entry_enabled=true — игнорирует сессии и всегда возвращает ENTRY.
+        Если manual_entry_enabled=false — штатная сессионная логика.
+        """
+        try:
+            from services.test_control import read as tc_read
+            tc = tc_read()
+            if tc.get("manual_entry_enabled"):
+                from datetime import datetime as _dt
+                h = _dt.utcnow().hour
+                if 0 <= h < 8:
+                    sn = "ASIA"
+                elif 8 <= h < 13:
+                    sn = "LONDON"
+                elif 13 <= h < 21:
+                    sn = "NEW_YORK"
+                else:
+                    sn = "OFF"
+                logger.info(f"MANUAL ENTRY MODE 24/7: session={sn} → ENTRY")
+                return "ENTRY", sn
+        except Exception as e:
+            logger.warning(f"manual_entry_enabled check failed: {e}")
+
+        try:
+            from core.session_engine import get_phase_for_orchestrator
+            phase, session, raw_phase = get_phase_for_orchestrator()
+            return phase, session
+        except Exception as e:
+            logger.error(f"_get_phase_and_session error: {e}")
+            return "OFF", "OFF"
+
+    async def run(self):
+        await self.setup()
+        await self._load_open_positions()
+        self._restore_ee_mon_from_db()
+
+        # Sync in-memory dicts with DB at startup
+        from modules.execution_engine import sync_open_positions_with_db, log_health
+        self._log_health_pre_sync()
+        sync_open_positions_with_db()
+        self._sync_orchestrator_positions()
+        self._log_health()
+        self._log_health_post_sync()
+
+        now = datetime.now(PODGORICA)
+        logger.info(f"Pipeline 24/7 mode — start at {now.hour}:{now.minute:02d}")
+
+        self.running = True
+        self.state_manager.set_state("running")
+        logger.info(f"Pipeline started at {datetime.now(PODGORICA)}")
+
+        _was_scanner_on = True
+
+        try:
+            while self.running:
+                scanner_on = self._tc_scanner_enabled()
+
+                if not scanner_on:
+                    if _was_scanner_on:
+                        logger.info(
+                            "test_control: scanner_enabled=False — FULL STOP initiated"
+                        )
+                        await self._full_stop_flow()
+                        _was_scanner_on = False
+
+                    await asyncio.sleep(self.config.get("cycle_interval", 60))
+                    continue
+
+                if not _was_scanner_on:
+                    logger.info("test_control: scanner_enabled=True — resuming pipeline")
+                _was_scanner_on = True
+
+                try:
+                    from services.test_control import read as tc_read
+                    _tc = tc_read()
+                    if _tc.get("hourly_test_enabled"):
+                        self.config["_hourly_test"] = True
+                    else:
+                        self.config.pop("_hourly_test", None)
+                except Exception as e:
+                    logger.warning(f"hourly_test_enabled check failed: {e}")
+
+                await self._run_cycle()
+                await asyncio.sleep(self.config.get("cycle_interval", 60))
+
+        except asyncio.CancelledError:
+            logger.info("Pipeline cancelled")
+        except Exception as e:
+            logger.error(f"Pipeline error: {e}", exc_info=True)
+            try:
+                from services.telegram_notifier import get_notifier
+                notifier = get_notifier()
+                if notifier:
+                    await notifier.send(f"🔴 PIPELINE ОСТАНОВЛЕН\n{str(e)[:200]}")
+            except Exception as te:
+                logger.error(f"Failed to send pipeline stop notification: {te}")
+        finally:
+            await self.stop()
+
+    async def _run_cycle(self):
+        """Один цикл пайплайна: Scanner → Strategy → SignalGate → Execution → Finalizer."""
+        cycle_id = self.id_manager.next_cycle_id()
+        start_time = time.time()
+        logger.info(f"[{cycle_id}] Cycle start")
+
+        phase, session = self._get_phase_and_session()
+        logger.info(f"[{cycle_id}] Phase={phase} Session={session}")
+
+        # --- PRE_SESSION SMC analysis ---
+        if phase == "PRE_SESSION":
+            if not self._pre_session_done.get(session):
+                logger.info(f"[{cycle_id}] ПОДГОТОВКА: SMC-анализ для {session}")
+                try:
+                    await self.scanner._ensure_connected()
+                    await self.pre_session.analyze(session)
+                    self._pre_session_done[session] = True
+                except Exception as e:
+                    logger.error(f"[{cycle_id}] PRE_SESSION analysis failed: {e}")
+            return
+
+        # --- OFF: вне всех сессий — только сканируем ---
+        if phase == "OFF":
+            try:
+                await self.scanner._ensure_connected()
+                candidates = await self.scanner.scan()
+                logger.info(f"[{cycle_id}] OFF: scanner finished, candidates={len(candidates)}")
+            except Exception as e:
+                logger.error(f"[{cycle_id}] OFF scanner failed: {e}", exc_info=True)
+                try:
+                    from services.telegram_notifier import get_notifier
+                    notifier = get_notifier()
+                    if notifier:
+                        await notifier.send(f"🚨 СКАНЕР ОШИБКА\n{cycle_id}\n{str(e)[:200]}")
+                except Exception as te:
+                    logger.error(f"Failed to send scanner error notification: {te}")
+            return
+
+        # --- WATCH: сопровождение / поздняя фаза — только мониторинг ---
+        if phase == "WATCH":
+            if self._open_positions:
+                open_list = list(self._open_positions.values())
+                await self.position_manager.monitor(open_list)
+                await self.finalizer.finalize(open_list)
+                self._open_positions = {
+                    s: p for s, p in self._open_positions.items()
+                    if p.get("status") == "open"
+                }
+
+            await self._close_profitable_positions(session)
+
+            # Post-monitor sync + health
+            from modules.execution_engine import sync_open_positions_with_db
+            self._log_health_pre_sync()
+            sync_open_positions_with_db()
+            self._sync_orchestrator_positions()
+            self._log_health()
+            self._log_health_post_sync()
+            return
+
+        # --- ENTRY catch-up: если PRE_SESSION пропущен ---
+        # Не блокируем ENTRY heavy PRE_SESSION-анализом:
+        # если catch-up не был выполнен заранее, пропускаем его внутри ENTRY,
+        # чтобы scanner.scan() дошёл до выполнения даже при rate limit.
+        if phase == "ENTRY" and session != "MANUAL" and not self._pre_session_done.get(session):
+            logger.warning(
+                f"[{cycle_id}] CATCH-UP SKIPPED: PRE_SESSION SMC для {session} "
+                f"пропущен внутри ENTRY, чтобы не блокировать scanner cycle"
+            )
+
+        # --- SYNC: убрать stale позиции из памяти перед входом ---
+        from modules.execution_engine import sync_open_positions_with_db
+        self._log_health_pre_sync()
+        sync_open_positions_with_db()
+        self._sync_orchestrator_positions()
+        self._log_health()
+        self._log_health_post_sync()
+
+        # --- ENTRY (ВХОД): полный pipeline ---
+        try:
+            self.signal_gate.reset(session_name=session)
+
+            if self._open_positions:
+                open_list = list(self._open_positions.values())
+                await self.position_manager.monitor(open_list)
+                await self.finalizer.finalize(open_list)
+                self._open_positions = {
+                    s: p for s, p in self._open_positions.items()
+                    if p.get("status") == "open"
+                }
+                logger.info(
+                    f"[{cycle_id}] Open positions after monitor: {len(self._open_positions)}"
+                )
+
+            # Post-monitor/finalizer sync + health
+            self._log_health_pre_sync()
+            sync_open_positions_with_db()
+            self._sync_orchestrator_positions()
+            self._log_health()
+            self._log_health_post_sync()
+
+            candidates = await self.scanner.scan()
+            if candidates:
+                current_prices = {
+                    c["symbol"]: c["price"]
+                    for c in candidates if c.get("price")
+                }
+
+                from modules.position_monitor import OPEN_POSITIONS as MON_POS
+                from modules.execution_engine import OPEN_POSITIONS as EE_POS
+
+                logger.info(
+                    f"[MONITOR] mon={len(MON_POS)} ee={len(EE_POS)} "
+                    f"prices={len(current_prices)}"
+                )
+
+                closed = position_monitor(current_prices)
+                if closed:
+                    logger.info(f"[MONITOR] Closed {len(closed)} positions")
+
+            if not candidates:
+                logger.info("[PIPELINE] No candidates — cycle skipped")
+                return
+
+            open_syms = set(self._open_positions.keys())
+            try:
+                from storage.db.repository import Repository
+                db_open = Repository().get_open_symbols()
+                if db_open - open_syms:
+                    logger.warning(
+                        f"[{cycle_id}] DB/memory mismatch — DB extra: {db_open - open_syms}"
+                    )
+                open_syms = open_syms | db_open
+            except Exception as e:
+                logger.error(f"[{cycle_id}] DB open_symbols check failed: {e}")
+
+            new_candidates = [c for c in candidates if c.get("symbol") not in open_syms]
+            logger.info(
+                f"[{cycle_id}] Candidates: {len(candidates)} total, "
+                f"{len(candidates) - len(new_candidates)} already open, "
+                f"{len(new_candidates)} new"
+            )
+
+            if not new_candidates:
+                logger.info(f"[{cycle_id}] All candidates already open — skip strategy")
+                return
+
+            signals = await self.strategy_engine.analyze(new_candidates)
+            logger.info(f"[DEBUG] Reaching AGS block — signals={len(signals)}")
+            # AGS Analytics — SMC снимок по кандидатам
+            try:
+                from modules.smc_analyzer import SMCAnalyzer
+                from datetime import datetime as _dt
+                from storage.db.repository import Repository as _Repo
+                _smc = SMCAnalyzer(self.config)
+                _repo_ags = _Repo()
+                _now = _dt.utcnow().isoformat()
+                _ags_written = 0
+                for _c in new_candidates:
+                    try:
+                        _sym = _c.get("symbol")
+                        _result = await _smc._analyze_symbol(self.scanner, _sym, "15m")
+                        if _result:
+                            _analysis_id = f"AGS_{_sym}_{_now.replace('-','').replace(':','').replace(' ','_').replace('.','')}"
+                            _h = int(_dt.utcnow().hour)
+                            _sn = "ASIA" if 0 <= _h < 8 else "LONDON" if 8 <= _h < 13 else "NEW_YORK" if 13 <= _h < 21 else "OFF"
+                            _repo_ags.conn.execute("""
+                                INSERT INTO APEX_AGS_ANALYTICS
+                                (analysis_id, symbol, exchange, market_type, timeframe,
+                                 analysis_time, created_at, session_name, hour_bucket,
+                                 timezone, session_group, day_of_week, weekend_flag,
+                                 pre_session_flag, session_open_flag, overlap_flag,
+                                 current_price, trend_state, market_structure_state,
+                                 volatility_state, atr_value, atr_percent,
+                                 volume_state, volume_ratio,
+                                 bos_detected, bos_direction, choch_detected, choch_direction,
+                                 market_shift_detected, structure_break_strength,
+                                 internal_structure_state, external_structure_state,
+                                 premium_zone_status, discount_zone_status, equilibrium_zone_status,
+                                 dealing_range_high, dealing_range_low, dealing_range_mid,
+                                 price_location_in_range,
+                                 liquidity_pool_present, liquidity_side,
+                                 equal_highs_present, equal_lows_present, liquidity_distance_pct,
+                                 sweep_present, sweep_side, sweep_strength, liquidity_taken_flag,
+                                 order_block_present, order_block_type, order_block_tf, order_block_freshness,
+                                 fvg_present, fvg_type, fvg_tf,
+                                 displacement_present, displacement_direction, displacement_strength,
+                                 impulse_candle_count, rejection_present, reaction_strength,
+                                 smc_alignment_score, liquidity_score, structure_score,
+                                 zone_score, momentum_score,
+                                 setup_quality, setup_direction, setup_valid_flag, invalidation_reason,
+                                 analyst_comment_short, market_row_source)
+                                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            """, (
+                                _analysis_id, _sym,
+                                _result.get("exchange", "Bybit"),
+                                _result.get("market_type", "FUTURES"),
+                                _result.get("timeframe", "15m"),
+                                _now, _now, _sn, _h,
+                                _result.get("timezone", "UTC"),
+                                _result.get("session_group", ""),
+                                _result.get("day_of_week", ""),
+                                _result.get("weekend_flag", 0),
+                                _result.get("pre_session_flag", 0),
+                                _result.get("session_open_flag", 1),
+                                _result.get("overlap_flag", 0),
+                                _result.get("current_price"),
+                                _result.get("trend_state"),
+                                _result.get("market_phase"),
+                                _result.get("volatility_state"),
+                                _result.get("atr_value"),
+                                _result.get("atr_percent"),
+                                _result.get("volume_state"),
+                                _result.get("volume_ratio"),
+                                _result.get("bos_present", 0),
+                                _result.get("bos_direction", "none"),
+                                _result.get("choch_present", 0),
+                                _result.get("choch_direction", "none"),
+                                _result.get("market_shift_detected", 0),
+                                _result.get("structure_break_strength", 0),
+                                _result.get("internal_structure_state"),
+                                _result.get("external_structure_state"),
+                                _result.get("premium_zone_status"),
+                                _result.get("discount_zone_status"),
+                                _result.get("equilibrium_zone_status"),
+                                _result.get("dealing_range_high"),
+                                _result.get("dealing_range_low"),
+                                _result.get("dealing_range_mid"),
+                                _result.get("price_location_in_range"),
+                                _result.get("liquidity_pool_present", 0),
+                                _result.get("liquidity_side"),
+                                _result.get("equal_highs_present", 0),
+                                _result.get("equal_lows_present", 0),
+                                _result.get("liquidity_distance_pct"),
+                                _result.get("sweep_present", 0),
+                                _result.get("sweep_side"),
+                                _result.get("sweep_strength"),
+                                _result.get("liquidity_taken_flag", 0),
+                                _result.get("entry_near_ob", 0),
+                                _result.get("order_block_type"),
+                                _result.get("order_block_tf"),
+                                _result.get("order_block_freshness"),
+                                _result.get("entry_near_fvg", 0),
+                                _result.get("fvg_type"),
+                                _result.get("fvg_tf"),
+                                _result.get("displacement_present", 0),
+                                _result.get("displacement_direction"),
+                                _result.get("displacement_strength"),
+                                _result.get("impulse_candle_count"),
+                                _result.get("rejection_present", 0),
+                                _result.get("reaction_strength"),
+                                _result.get("smc_alignment_score"),
+                                _result.get("liquidity_score"),
+                                _result.get("structure_score"),
+                                _result.get("zone_score"),
+                                _result.get("momentum_score"),
+                                _result.get("setup_quality"),
+                                _result.get("setup_direction"),
+                                _result.get("setup_valid_flag", 0),
+                                _result.get("invalidation_reason"),
+                                _result.get("analyst_comment_short"),
+                                "AGS_ENGINE",
+                            ))
+                        _repo_ags.conn.commit()
+                        _ags_written += 1
+                    except Exception as _se:
+                        logger.error(f"[AGS] INSERT failed for {_sym}: {_se}")
+                logger.info(f"[AGS] SMC snapshot: {_ags_written}/{len(new_candidates)} pairs written")
+            except Exception as _ae:
+                logger.warning(f"AGS Analytics failed: {_ae}")
+            if not signals:
+                return
+
+            approved = await self.signal_gate.filter(
+                signals,
+                open_symbols=set(self._open_positions.keys())
+            )
+            if not approved:
+                logger.info("[PIPELINE] No approved signals — cycle completed without entries")
+                return
+
+            logger.info(f"[{cycle_id}] Approved signals: {len(approved)}")
+
+            from modules.execution_engine import OPEN_POSITIONS as EE_POS
+            for sym, order in EE_POS.items():
+                if sym not in self._open_positions:
+                    self._open_positions[sym] = order
+                    logger.info(f"[{cycle_id}] Synced: {sym} [{order.get('mode')}]")
+
+            duration = round(time.time() - start_time, 2)
+            logger.info(f"[PIPELINE] Cycle duration: {duration}s")
+            logger.info("[PIPELINE] Cycle completed")
+
+        except Exception as e:
+            logger.error(f"[{cycle_id}] Cycle error: {e}", exc_info=True)
+
+    async def _close_single_position(self, symbol: str, position: dict, reason: str):
+        """RC-6: полноценная запись полей закрытия — выровнена с finalizer."""
+        now_dt = datetime.now(PODGORICA)
+        now = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+        try:
+            from storage.db.repository import Repository
+            repo = Repository()
+
+            entry = float(position.get("entry") or position.get("fill_price") or 0)
+            direction = position.get("direction", "long")
+            size = float(position.get("size") or 0)
+            exchange_name = str(position.get("exchange_name") or "BYBIT").upper()
+            fee_percent = get_fee_rate(exchange_name, "taker")
+            commission = fee_percent
+
+            close_price = float(position.get("current_price") or entry)
+
+            # Gross PnL — правильная формула
+            if entry and close_price and size:
+                if direction.lower() == "long":
+                    gross_pnl_usdt = round((close_price - entry) * size, 6)
+                else:
+                    gross_pnl_usdt = round((entry - close_price) * size, 6)
+            else:
+                gross_pnl_usdt = 0.0
+
+            # Fees
+            fee_rate = commission / 100.0
+            fees_open_usdt = abs(entry * size) * fee_rate if (entry and size) else 0.0
+            fees_close_usdt = abs(close_price * size) * fee_rate if (close_price and size) else 0.0
+            total_fees_usdt = fees_open_usdt + fees_close_usdt
+            net_pnl_usdt = round(gross_pnl_usdt - total_fees_usdt, 6)
+
+            notional = abs(entry * size) if (entry and size) else 0
+            gross_pnl_pct = round((gross_pnl_usdt / notional) * 100, 4) if notional > 0 else 0.0
+            net_pnl_pct = round((net_pnl_usdt / notional) * 100, 4) if notional > 0 else 0.0
+
+            # Duration
+            opened_at_str = position.get("opened_at")
+            duration_minutes = None
+            if opened_at_str:
+                try:
+                    opened_dt = datetime.fromisoformat(opened_at_str)
+                    if opened_dt.tzinfo is None:
+                        opened_dt = PODGORICA.localize(opened_dt)
+                    duration_minutes = int((now_dt - opened_dt).total_seconds() / 60)
+                except Exception:
+                    duration_minutes = None
+
+            # close_trigger_side
+            close_trigger_side = "LONG" if direction.lower() == "long" else "SHORT"
+
+            # actual_rr / r_multiple — от initial_sl
+            sl_val = float(position.get("sl") or 0)
+            initial_sl_val = float(position.get("initial_sl") or sl_val or 0)
+            sl_dist = abs(entry - initial_sl_val) if (entry and initial_sl_val) else 0
+            if sl_dist > 0:
+                if direction.lower() == "long":
+                    signed_dist = close_price - entry
+                else:
+                    signed_dist = entry - close_price
+                actual_rr = round(signed_dist / sl_dist, 4)
+            else:
+                actual_rr = None
+            r_multiple = actual_rr
+
+            # MFE / MAE approximation
+            if entry and close_price:
+                if direction.lower() == "long":
+                    mfe = round(max(close_price - entry, 0) / entry * 100, 4)
+                    mae = round(max(entry - close_price, 0) / entry * 100, 4)
+                else:
+                    mfe = round(max(entry - close_price, 0) / entry * 100, 4)
+                    mae = round(max(close_price - entry, 0) / entry * 100, 4)
+            else:
+                mfe = 0.0
+                mae = 0.0
+
+            # tp_level_reached_max
+            reason_upper = (reason or "").upper()
+            if reason_upper == "TP3":
+                tp_level = 3
+            elif reason_upper == "TP2":
+                tp_level = 2
+            elif reason_upper == "TP1":
+                tp_level = 1
+            else:
+                tp_level = 0
+
+            # exit_reason_text
+            _EXIT_TEXT = {
+                "SL": "Stop Loss triggered",
+                "TP1": "Take Profit 1 reached",
+                "TP2": "Take Profit 2 reached",
+                "TP3": "Take Profit 3 reached",
+                "TIMEOUT": "Position timeout",
+                "TIMEOUT_PROFIT_60": "Timeout with profit after 60 min",
+                "FORCE_CLOSE_120M": "Forced close at 120 min session limit",
+                "TIME_EXIT_PROFIT": "Time-based exit in profit",
+                "TIME_EXIT_FORCE": "Time-based forced exit",
+                "SESSION_END": "Session ended",
+                "SESSION_PROFIT_TAKE": "Session profit take in WATCH phase",
+                "EMERGENCY_EXIT": "Emergency exit",
+                "MANUAL": "Manual close",
+                "MANUAL_STOP": "Manual stop",
+                "MANUAL_CLOSE": "Manual close",
+            }
+            exit_reason_text = _EXIT_TEXT.get(reason_upper, reason)
+
+            repo.log_final_trade({
+                "symbol": symbol,
+                "direction": direction,
+                "strategy": position.get("strategy"),
+                "entry": entry,
+                "fill_price": entry,
+                "close_price": close_price,
+                "sl": sl_val,
+                "tp1": position.get("tp1"),
+                "tp2": position.get("tp2"),
+                "tp3": position.get("tp3"),
+                "size": size,
+                "leverage": position.get("leverage", 1),
+                "commission": commission,
+                "gross_pnl_usdt": gross_pnl_usdt,
+                "gross_pnl_pct": gross_pnl_pct,
+                "pnl_pct": net_pnl_pct,
+                "pnl_usdt": gross_pnl_usdt,
+                "net_pnl_usdt": net_pnl_usdt,
+                "net_pnl_pct": net_pnl_pct,
+                "fees_open_usdt": fees_open_usdt,
+                "fees_close_usdt": fees_close_usdt,
+                "total_fees_usdt": total_fees_usdt,
+                "close_reason": reason,
+                "exit_reason_code": reason,
+                "exit_reason_text": exit_reason_text,
+                "close_trigger_side": close_trigger_side,
+                "actual_rr": actual_rr,
+                "r_multiple": r_multiple,
+                "max_favorable_excursion_mfe": mfe,
+                "max_adverse_excursion_mae": mae,
+                "tp_level_reached_max": tp_level,
+                "mode": position.get("mode", "simulation"),
+                "session_hour": position.get("session_hour"),
+                "opened_at": opened_at_str,
+                "closed_at": now,
+                "finalized_at": now,
+                "trade_id": position.get("trade_id"),
+                "session_name": position.get("session_name"),
+                "duration_minutes": duration_minutes,
+                "minutes_to_close": duration_minutes,
+                "strategy_name": position.get("strategy_name") or self.config.get("active_filter"),
+            })
+
+        except Exception as e:
+            logger.error(f"_close_single_position({symbol}) error: {e}", exc_info=True)
+
+    async def _close_profitable_positions(self, session: str = ""):
+        if not self._open_positions:
+            return
+
+        try:
+            to_close = []
+            for symbol, pos in self._open_positions.items():
+                entry = pos.get("entry") or pos.get("fill_price")
+                direction = pos.get("direction", "long")
+                current_price = pos.get("current_price") or entry
+
+                if not current_price or not entry:
+                    continue
+
+                if direction == "long":
+                    pnl_pct = ((current_price - entry) / entry) * 100
+                else:
+                    pnl_pct = ((entry - current_price) / entry) * 100
+
+                if pnl_pct > 0:
+                    logger.info(f"WATCH [{session}]: closing {symbol} in profit +{pnl_pct:.2f}%")
+                    to_close.append(symbol)
+
+            for symbol in to_close:
+                pos = self._open_positions.pop(symbol)
+                await self._close_single_position(symbol, pos, "SESSION_PROFIT_TAKE")
+
+            if to_close:
+                logger.info(f"WATCH [{session}]: closed {len(to_close)} profitable positions")
+
+        except Exception as e:
+            logger.error(f"_close_profitable_positions error: {e}", exc_info=True)
+
+    async def _run_top20_breakout_cycle(self, cycle_id: str):
+        logger.warning(f"[{cycle_id}] TOP20_1M_BREAKOUT_v1 is disabled — archived strategy")
+        return
+
+    async def stop(self):
+        self.running = False
+        self.state_manager.set_state("stopped")
+
+        try:
+            if self.scanner and self.scanner.exchange_service:
+                await self.scanner.exchange_service.close()
+                logger.info("ExchangeService: connection closed on stop")
+        except Exception as e:
+            logger.warning(f"ExchangeService close error: {e}")
+
+        logger.info("Pipeline stopped")

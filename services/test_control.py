@@ -29,6 +29,7 @@ DEFAULT_STATE = {
     "param_tp3_pct": None,
     "param_leverage": None,
     "param_size_usdt": None,
+    "param_risk_usdt": None,
     "ny_5m_active": False,
     "ny_5m_started_at": None,
     "strategy_mode": "DEFAULT",

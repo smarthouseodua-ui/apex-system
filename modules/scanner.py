@@ -1,18 +1,26 @@
 import asyncio
 """
 APEX PROTOCOL™ — Scanner
-Сканирует рынок, находит кандидатов. Пишет в SKL01_T01_scanner_log.
+Сканирует рынок, находит кандидатов. Пишет в APEX_MASTER_SCANNER.
 """
 
+import json
 import sys
 import logging
 from datetime import datetime
 from core.event_bus import EventBus
+from core.time_manager import TimeManager
 from services.exchange_service import ExchangeService
+from services.exchanges.exchange_router import get_exchange_services
 from storage.db.repository import Repository
 
-sys.path.insert(0, "/root/data-core")
-from app import write_scanner_results_batch
+try:
+    sys.path.insert(0, "/root/data-core")
+    from app import write_scanner_results_batch
+except Exception:
+    def write_scanner_results_batch(pairs):
+        pass
+
 from modules.runtime_state import scanner_state, update_scanner_state
 
 logger = logging.getLogger("apex.scanner")
@@ -24,70 +32,88 @@ class Scanner:
         self.config = config
         self.event_bus = event_bus
         self.exchange_service = ExchangeService(config)
+        self._exchange_services = {}
         self.repo = Repository()
+        self._time_manager = TimeManager(config)
         self._connected = False
+        self._scan_counter = 0
 
     async def _ensure_connected(self):
         if not self._connected:
             await self.exchange_service.connect()
             self._connected = True
+        # Подключаем все активные биржи через Router
+        self._exchange_services = get_exchange_services(self.config)
+        for name, svc in self._exchange_services.items():
+            try:
+                await svc.connect()
+            except Exception as e:
+                logger.error(f"[Scanner] failed to connect {name}: {e}")
+
+    def _next_scan_run_id(self) -> str:
+        self._scan_counter += 1
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return f"SCN-{ts}-{self._scan_counter:04d}"
 
     async def scan(self) -> list:
         try:
             await self._ensure_connected()
             cycle_ts = datetime.now().isoformat()
+            scan_run_id = self._next_scan_run_id()
 
-            # Stage 1: Universe
             pairs = await self._fetch_universe(cycle_ts)
             scanner_state["total_pairs"] = len(pairs)
             logger.info(f"[SCANNER] Universe: {len(pairs)}")
 
-            # Stage 2: Liquidity
             pairs = self._filter_liquidity(pairs)
             scanner_state["after_liquidity"] = len(pairs)
             logger.info(f"[SCANNER] Liquidity: {len(pairs)}")
 
-            # Stage 3: Volatility
             pairs = self._filter_volatility(pairs)
             scanner_state["after_volatility"] = len(pairs)
             logger.info(f"[SCANNER] Volatility: {len(pairs)}")
 
-            # Stage 4: Structure
             pairs = await self._filter_structure(pairs)
             scanner_state["after_structure"] = len(pairs)
             logger.info(f"[SCANNER] Structure: {len(pairs)}")
 
-            # Stage 4.5: Early garbage filter
             pairs = [p for p in pairs if p.get("volume", 0) > 0 and p.get("price", 0) > 0]
 
-            # Stage 5: Score
             pairs = self._apply_score(pairs)
             scanner_state["scored"] = len(pairs)
             scanner_state["top_score"] = pairs[0]["score"] if pairs else 0
             logger.info(f"[SCANNER] Top score: {pairs[0]['score'] if pairs else 0}")
 
-            # Stage 6: Reasons/Tags
             pairs = self._apply_reasons(pairs)
             logger.info(f"[SCANNER] Reasons ready: {len(pairs)}")
 
-            # Stage 7: Statuses
             pairs = self._apply_statuses(pairs)
             logger.info(f"[SCANNER] Statuses ready: {len(pairs)}")
 
-            # Stage 8: Scanner-ready
             logger.info(f"[SCANNER] Scanner-ready: {len(pairs)}")
 
+            current_session = self._time_manager.current_session()
             for c in pairs:
-                self.repo.log_scanner(c)
+                if not c.get("session"):
+                    c["session"] = current_session
+                packet = self._build_scanner_packet(c, scan_run_id)
+                if not packet.get('strategy_name'):
+                    packet['strategy_name'] = self.config.get('active_strategy_name') or self.config.get('strategy_name') or 'UNKNOWN'
+                self.repo.log_scanner(packet)
 
-            # ── DATA CORE: batch write ───────────────────────────
             try:
                 write_scanner_results_batch(pairs)
                 logger.info(f"[SCANNER] DATA CORE: {len(pairs)} pairs written")
             except Exception as e:
                 logger.error(f"[SCANNER] DATA CORE write failed: {e}")
+                try:
+                    import traceback as _tb
+                    from storage.db.repository import Repository as _Repo
+                    _Repo().log_system_event(event="DATA_CORE_WRITE_FAILED", module="scanner",
+                        message=str(e), level="ERROR", traceback=_tb.format_exc())
+                except Exception:
+                    pass
 
-            # Минимальный тренд-фильтр: отклонение от EMA >= 0.2%
             before_ema = len(pairs)
             pairs = [
                 p for p in pairs
@@ -103,12 +129,11 @@ class Scanner:
             filtered = [
                 p for p in pairs
                 if p.get("candidate_status") == "SENT_TO_FILTER"
-                and p.get("score", 0) >= 65
+                and p.get("score", 0) >= 55
             ]
             scanner_state["candidates"] = len(filtered)
             scanner_state["signals"] = len(filtered)
 
-            # Determine reject reason
             reject_reason = ""
             if len(filtered) == 0:
                 top = scanner_state["top_score"]
@@ -119,7 +144,7 @@ class Scanner:
                 elif sent_to_filter_raw == 0:
                     reject_reason = f"нет SENT_TO_FILTER (score < 60, top={top})"
                 elif top < 65:
-                    reject_reason = f"score ниже порога (top={top}, нужно 65)"
+                    reject_reason = f"score ниже порога (top={top}, нужно 55)"
                 else:
                     reject_reason = "финальный фильтр"
 
@@ -136,6 +161,26 @@ class Scanner:
                 sent_to_filter_raw=sent_to_filter_raw,
                 last_reject_reason=reject_reason,
             )
+
+            try:
+                current_session = self._time_manager.current_session()
+                self.repo.log_scanner_summary({
+                    "scan_run_id": scan_run_id,
+                    "session_name": current_session,
+                    "phase": "",
+                    "total_pairs": scanner_state["total_pairs"],
+                    "after_liquidity": scanner_state["after_liquidity"],
+                    "after_volatility": scanner_state["after_volatility"],
+                    "after_structure": scanner_state["after_structure"],
+                    "scored": scanner_state["scored"],
+                    "candidates": len(filtered),
+                    "signals": len(filtered),
+                    "top_score": scanner_state["top_score"],
+                    "last_reject_reason": reject_reason,
+                })
+            except Exception as e:
+                logger.error(f"[SCANNER] log_scanner_summary failed: {e}")
+
             logger.info(f"[SCANNER] Sent to filter: {len(filtered)}")
             for f in filtered:
                 print(f"[SIGNAL] {f.get('symbol')} score={f.get('score')}")
@@ -150,27 +195,87 @@ class Scanner:
 
         except Exception as e:
             logger.error(f"Scanner error: {e}", exc_info=True)
+            try:
+                import traceback as _tb
+                from storage.db.repository import Repository as _Repo
+                _Repo().log_system_event(event="SCANNER_ERROR", module="scanner",
+                    message=str(e), level="ERROR", traceback=_tb.format_exc())
+            except Exception:
+                pass
             return []
 
-    # ── Stage 1: Universe ────────────────────────────────────────────────
-    async def _fetch_universe(self, cycle_ts: str) -> list:
-        """Получить все пары с биржи. Базовая валидация: price > 0, USDT quote."""
-        cfg = self.config.get("scanner", {})
-        quote_currency = cfg.get("quote_currency", "USDT")
-        blacklist = cfg.get("blacklist", [])
+    def _build_scanner_packet(self, pair: dict, scan_run_id: str) -> dict:
+        price = pair.get("price", 0) or 0
+        high = pair.get("high", price) or price
+        low = pair.get("low", price) or price
+        range_mid = (high + low) / 2 if (high is not None and low is not None) else price
 
-        tickers = await self.exchange_service.get_tickers()
+        distance_to_ema = None
+        ema = pair.get("ema")
+        if ema not in (None, 0) and price:
+            distance_to_ema = round(abs(price - ema) / ema * 100, 4)
+
+        is_premium_zone = 1 if price > range_mid else 0
+        is_discount_zone = 1 if price < range_mid else 0
+        is_equilibrium_zone = 1 if range_mid and abs(price - range_mid) / range_mid <= 0.001 else 0
+
+        return {
+            "symbol": pair.get("symbol"),
+            "price": pair.get("price"),
+            "volume": pair.get("volume"),
+            "volatility": pair.get("volatility"),
+            "session": pair.get("session"),
+            "scanned_at": pair.get("scanned_at", datetime.now().isoformat()),
+            "scan_run_id": scan_run_id,
+            "score": pair.get("score"),
+            "candidate_status": pair.get("candidate_status"),
+            "trend": pair.get("structure"),
+            "ema": ema,
+            "distance_to_ema": distance_to_ema,
+            "is_premium_zone": is_premium_zone,
+            "is_discount_zone": is_discount_zone,
+            "is_equilibrium_zone": is_equilibrium_zone,
+            "bos": 0,
+            "choch": 0,
+            "liq_sweep": 0,
+            "fvg": 0,
+            "ob": 0,
+            "reason_tags": pair.get("reasons", []),
+            "raw_json": json.dumps(pair, ensure_ascii=False, default=str),
+            "strategy_name": self.config.get("active_strategy_name"),
+        }
+
+    async def _fetch_universe(self, cycle_ts: str) -> list:
+        cfg = self.config.get("scanner", {})
+        blacklist = cfg.get("blacklist", [])
         pairs = []
-        for symbol, ticker in tickers.items():
+
+        # Сканируем все активные биржи через Router
+        for exch_name, svc in self._exchange_services.items():
             try:
-                if not symbol.endswith(f":{quote_currency}"):
+                exch_pairs = await svc.get_tickers()
+                for p in exch_pairs:
+                    if p.get("symbol") in blacklist:
+                        continue
+                    p["scanned_at"] = cycle_ts
+                    pairs.append(p)
+                logger.info(f"[Scanner] {exch_name}: {len(exch_pairs)} pairs")
+            except Exception as e:
+                logger.error(f"[Scanner] {exch_name} fetch error: {e}")
+
+        # Fallback: если Router не дал пар — используем старый ExchangeService
+        if not pairs:
+            logger.warning("[Scanner] Router returned 0 pairs — fallback to ExchangeService")
+            tickers = await self.exchange_service.get_tickers()
+            for symbol, ticker in tickers.items():
+                if not symbol.endswith(":USDT"):
                     continue
                 if symbol in blacklist:
                     continue
                 price = ticker.get("last", 0)
                 volume = ticker.get("quoteVolume", 0)
-                high = ticker.get("high", price)
-                low = ticker.get("low", price)
+                high = ticker.get("high", price) or price
+                low = ticker.get("low", price) or price
                 if price and price > 0:
                     volatility = round(((high - low) / price) * 100, 4)
                     pairs.append({
@@ -180,15 +285,13 @@ class Scanner:
                         "volatility": volatility,
                         "high": high,
                         "low": low,
-                        "scanned_at": cycle_ts
+                        "scanned_at": cycle_ts,
+                        "exchange_name": "bybit",
                     })
-            except Exception:
-                continue
+
         return pairs
 
-    # ── Stage 2: Liquidity ───────────────────────────────────────────────
     def _filter_liquidity(self, pairs: list) -> list:
-        """Фильтр ликвидности: volume >= min_volume, данные валидны."""
         cfg = self.config.get("scanner", {})
         min_volume = cfg.get("min_volume", 50_000_000)
 
@@ -200,9 +303,7 @@ class Scanner:
         result.sort(key=lambda x: x.get("volume", 0), reverse=True)
         return result
 
-    # ── Stage 3: Volatility ──────────────────────────────────────────────
     def _filter_volatility(self, pairs: list) -> list:
-        """Фильтр волатильности: volatility в допустимом диапазоне."""
         cfg = self.config.get("scanner", {})
         min_volatility = cfg.get("min_volatility", 0.5)
         max_volatility = cfg.get("max_volatility", 15.0)
@@ -212,24 +313,23 @@ class Scanner:
             if min_volatility <= p.get("volatility", 0) <= max_volatility
         ]
 
-    # ── Stage 4: Structure ───────────────────────────────────────────────
     async def _filter_structure(self, pairs: list) -> list:
-        """Фильтр структуры: цена vs EMA-20 на 15m свечах.
-        Пропускает пару только если цена отклоняется от EMA >= 0.1%
-        (есть выраженный тренд, а не боковик).
-        """
         cfg = self.config.get("scanner", {})
         max_candidates = cfg.get("max_candidates", 20)
         ema_period = cfg.get("structure_ema_period", 20)
         ema_min_deviation = cfg.get("structure_ema_min_deviation", 0.1)
 
         result = []
+        pairs = pairs[:60]
         for p in pairs:
             try:
-                await asyncio.sleep(0.15)  # throttle — защита от Rate Limit
-                ohlcv = await self.exchange_service.get_ohlcv(
-                    p["symbol"], timeframe="15m", limit=ema_period + 5
-                )
+                await asyncio.sleep(0.55)
+                exch_name = p.get("exchange_name", "bybit")
+                exch_svc = self._exchange_services.get(exch_name, self._exchange_services.get("bybit"))
+                if exch_svc:
+                    ohlcv = await exch_svc.get_ohlcv(p["symbol"], timeframe="15m", limit=ema_period + 5)
+                else:
+                    ohlcv = await self.exchange_service.get_ohlcv(p["symbol"], timeframe="15m", limit=ema_period + 5)
                 if not ohlcv or len(ohlcv) < ema_period:
                     continue
 
@@ -253,9 +353,7 @@ class Scanner:
         result.sort(key=lambda x: x.get("volume", 0), reverse=True)
         return result[:max_candidates]
 
-    # ── Stage 5: Score ─────────────────────────────────────────────────
     def _apply_score(self, pairs: list) -> list:
-        """Расчёт score (0–100) — ребалансированная формула."""
         if not pairs:
             return pairs
 
@@ -271,41 +369,30 @@ class Scanner:
             high = p.get("high", price)
             low = p.get("low", price)
 
-            # 0. base_score (15): базовый уровень для всех пар прошедших structure
             base_score = 15
-
-            # 1. liquidity_score (0–25): нормализация относительно макс. в списке
             liquidity_score = min(25, (volume / max_volume) * 25) if max_volume > 0 else 0
 
-            # 2. trend_score (0–25): EMA deviation * 300
             ema_safe = max(ema, 1e-9)
             trend_score = min(25, abs(price - ema) / ema_safe * 300)
 
-            # 3. momentum_score (0–20): направленное движение
             momentum = (price - low) / max(high - low, 1e-9) if high != low else 0.5
-            momentum_score = min(20, momentum * 700 * 0.02857)  # ~20 max
+            momentum_score = min(20, momentum * 700 * 0.02857)
 
-            # 4. volatility_score (0–20): нормализованная волатильность
             volatility_norm = volatility / max_volatility if max_volatility > 0 else 0
-            volatility_score = min(20, volatility_norm * 1500 * 0.01333)  # ~20 max
+            volatility_score = min(20, volatility_norm * 1500 * 0.01333)
 
-            # 5. range_score (0–15): range expansion
             avg_range = (high + low) / 2 if (high + low) > 0 else 1
             range_expansion = (high - low) / max(avg_range, 1e-9) * 100
             range_score = min(15, max(0, (range_expansion - 1) * 10))
 
             score = base_score + liquidity_score + trend_score + momentum_score + volatility_score + range_score
-
-            # Ограничение итогового score
             score = max(0, min(100, int(score)))
             p["score"] = score
 
         pairs.sort(key=lambda x: x.get("score", 0), reverse=True)
         return pairs
 
-    # ── Stage 6: Reasons/Tags ──────────────────────────────────────────
     def _apply_reasons(self, pairs: list) -> list:
-        """Присвоить стандартизированные tags каждой паре."""
         if not pairs:
             return pairs
 
@@ -346,14 +433,12 @@ class Scanner:
 
         return pairs
 
-    # ── Stage 7: Statuses ──────────────────────────────────────────────
     def _apply_statuses(self, pairs: list) -> list:
-        """Присвоить candidate_status каждой паре на основе score."""
         for p in pairs:
             status = "SCANNED"
             score = p.get("score", 0)
 
-            if score >= 65:
+            if score >= 55:
                 status = "SENT_TO_FILTER"
             elif score >= 45:
                 status = "PASSED"
@@ -368,7 +453,6 @@ class Scanner:
 
     @staticmethod
     def _calc_ema(closes: list, period: int) -> float:
-        """Рассчитать EMA по списку closes."""
         multiplier = 2 / (period + 1)
         ema = closes[0]
         for close in closes[1:]:

@@ -1,0 +1,10 @@
+{
+  "lab_balance": 100000.0,
+  "risk_pct_per_trade": 0.5,
+  "risk_usdt_per_trade": 500.0,
+  "risk_source": "VIRTUAL",
+  "bypass_global_risk_guards": true,
+  "execution_path": "FALLBACK",
+  "interval_seconds": 5,
+  "active_scenarios": []
+}

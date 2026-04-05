@@ -1,0 +1,18 @@
+{
+  "active_strategy_name": "APEX_ORB_5M",
+  "timeframe": "5m",
+  "ema_fast": 9,
+  "ema_slow": 21,
+  "volume_multiplier": 1.2,
+  "sl_pct": 1.0,
+  "tp1_pct": 1.5,
+  "tp2_pct": 2.5,
+  "tp3_pct": 3.5,
+  "time_exit_minutes": 90,
+  "max_concurrent_positions": 500,
+  "min_score_threshold": 40,
+  "cycle_interval": 60,
+  "risk": {
+    "blocked_hours": []
+  }
+}

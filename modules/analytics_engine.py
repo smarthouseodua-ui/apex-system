@@ -1,27 +1,28 @@
 # analytics_engine.py
 
-import csv
 import logging
 from datetime import datetime
 
 logger = logging.getLogger("apex.analytics_engine")
 
-FILE_PATH = "/root/apex-system/storage/simulation_results.csv"
-
 
 def load_results():
-    results = []
-
     try:
-        with open(FILE_PATH, "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                row["pnl"] = float(row["pnl"])
-                results.append(row)
-    except FileNotFoundError:
+        from storage.db.repository import Repository
+        repo = Repository()
+        rows = repo.conn.execute(
+            "SELECT * FROM APEX_MASTER_TRADE ORDER BY opened_at DESC"
+        ).fetchall()
+        results = []
+        for row in rows:
+            d = dict(row)
+            d["pnl"] = float(d.get("pnl_usdt") or 0)
+            d["close_reason"] = d.get("close_reason") or "UNKNOWN"
+            results.append(d)
+        return results
+    except Exception as e:
+        logger.error(f"load_results error: {e}")
         return []
-
-    return results
 
 
 def compute_stats(results):
@@ -108,7 +109,7 @@ def generate_session_stats() -> dict:
 
     today = datetime.now().strftime("%Y-%m-%d")
     rows = repo.conn.execute(
-        "SELECT * FROM SKL01_T07_final_trade_results WHERE finalized_at >= ?",
+        "SELECT * FROM APEX_MASTER_TRADE WHERE finalized_at >= ?",
         (today,)
     ).fetchall()
 
@@ -125,8 +126,8 @@ def generate_session_stats() -> dict:
     result = {}
     for session_name, trades in by_session.items():
         total = len(trades)
-        wins = sum(1 for t in trades if t.get("result_label") in ("tp1_hit", "tp2_hit", "tp3_hit"))
-        losses = sum(1 for t in trades if t.get("result_label") == "loss")
+        wins = sum(1 for t in trades if (t.get("result_label") or "").upper() == "WIN")
+        losses = sum(1 for t in trades if (t.get("result_label") or "").upper() == "LOSS")
         winrate = round((wins / total) * 100, 2) if total else 0.0
 
         mtc_values = [t["minutes_to_close"] for t in trades if t.get("minutes_to_close")]
@@ -144,11 +145,11 @@ def generate_session_stats() -> dict:
             "winrate": winrate,
             "avg_minutes_to_close": avg_mtc,
             "avg_R_result": avg_r,
-            "count_tp1": sum(1 for t in trades if t.get("close_event_type") == "TP1"),
-            "count_tp2": sum(1 for t in trades if t.get("close_event_type") == "TP2"),
-            "count_tp3": sum(1 for t in trades if t.get("close_event_type") == "TP3"),
-            "count_stop_loss": sum(1 for t in trades if t.get("close_event_type") == "STOP_LOSS"),
-            "count_force_close": sum(1 for t in trades if t.get("close_event_type") == "FORCE_CLOSE_120M"),
+            "count_tp1": sum(1 for t in trades if (t.get("close_reason") or "").upper() in ("TP1",)),
+            "count_tp2": sum(1 for t in trades if (t.get("close_reason") or "").upper() in ("TP2",)),
+            "count_tp3": sum(1 for t in trades if (t.get("close_reason") or "").upper() in ("TP3", "SESSION_PROFIT_TAKE")),
+            "count_stop_loss": sum(1 for t in trades if (t.get("close_reason") or "").upper() == "SL"),
+            "count_force_close": sum(1 for t in trades if (t.get("close_reason") or "").upper() in ("FORCE_CLOSE_120M", "TIMEOUT", "SESSION_END")),
             "count_observation_entered": sum(1 for t in trades if t.get("entered_observation")),
         }
         repo.upsert_session_stats(stats)

@@ -23,7 +23,7 @@ class IdManager:
 
     def next_trade_id(self) -> str:
         self._trade_counter += 1
-        ts = datetime.now().strftime("%Y%m%d%H%M%S")
+        ts = datetime.now().strftime("%Y%m%d%H%M%S%f")[:17]
         return f"TRD-{ts}-{self._trade_counter:04d}"
 
     def next_order_id(self) -> str:

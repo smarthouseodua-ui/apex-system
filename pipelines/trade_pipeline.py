@@ -29,6 +29,13 @@ class TradePipeline:
         except Exception:
             tc = {}
 
+        # Ручной режим: manual_entry_enabled — обходит все сессионные проверки
+        if tc.get("manual_entry_enabled"):
+            mode = tc.get("mode", "RUN")
+            logger.info(f"MANUAL MODE [{mode}] — session guards bypassed")
+            await self.orchestrator.run()
+            return
+
         if tc.get("test_enabled") or tc.get("hourly_test_enabled"):
             mode = tc.get("mode", "TEST")
             logger.info(f"Test control ACTIVE [{mode}] — bypassing session guard")
@@ -45,7 +52,7 @@ class TradePipeline:
             await self.orchestrator.run()
             return
 
-        # Штатная логика
+        # Штатная логика (сессионная, для будущего использования)
         self.config.pop("_hourly_test", None)
 
         session_info = self.time_manager.get_session_info()
@@ -53,10 +60,6 @@ class TradePipeline:
 
         if self.time_manager.is_blocked_hour():
             logger.warning(f"Blocked hour {self.time_manager.current_hour()}:xx — pipeline paused")
-            return
-
-        if False and not self.time_manager.is_trading_time():
-            logger.info("OFF session — pipeline skipped")
             return
 
         await self.orchestrator.run()

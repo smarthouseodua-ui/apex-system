@@ -1,0 +1,161 @@
+import traceback
+from datetime import datetime, timedelta, timezone
+from modules.pnl_engine import calculate_pnl
+from modules.risk_manager import update_after_trade
+from storage.db.repository import Repository
+
+OPEN_POSITIONS = {}
+
+ENTRY_MIN = 85
+OBSERVE_MIN = 30
+
+
+def _get_session_times(position):
+    try:
+        session_open = position.get("session_open_time")
+        if isinstance(session_open, str):
+            session_open = datetime.fromisoformat(session_open.replace("Z", "+00:00"))
+        if not session_open:
+            return None, None, None
+
+        # Нормализация: если naive — считаем UTC
+        if session_open.tzinfo is None:
+            session_open = session_open.replace(tzinfo=timezone.utc)
+
+        entry_end = session_open + timedelta(minutes=ENTRY_MIN)
+        hard_close = entry_end + timedelta(minutes=OBSERVE_MIN)
+
+        return session_open, entry_end, hard_close
+    except Exception:
+        return None, None, None
+
+
+def add_position(order: dict):
+    symbol = order["symbol"]
+    entry = float(order.get("entry_price") or order.get("entry") or 0)
+    side = str(order.get("side", "LONG")).upper()
+
+    OPEN_POSITIONS[symbol] = {
+        **order,
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "entry_price": entry,
+        "opened_at": datetime.now(timezone.utc),
+        "status": "open",
+        "current_price": entry,
+    }
+
+
+def should_close(position: dict, current_price: float):
+    now = datetime.now(timezone.utc)
+
+    session_open, entry_end, hard_close = _get_session_times(position)
+
+    # fallback если нет времени
+    if not session_open:
+        return None
+
+    pnl = calculate_pnl({**position, "current_price": current_price})
+
+    # 1. В конце ENTRY закрываем ВСЁ, что не в минусе
+    if entry_end and now >= entry_end:
+        if pnl >= 0:
+            return "TIME_EXIT_PROFIT"
+
+    # 2. Жёсткое закрытие ВСЕХ
+    if hard_close and now >= hard_close:
+        return "TIME_EXIT_FORCE"
+
+    return None
+
+
+def close_position(symbol: str, reason: str, price: float):
+    pos = OPEN_POSITIONS[symbol]
+
+    close_price = float(price or pos.get("current_price") or pos.get("entry_price") or 0)
+
+    pos["status"] = "closed"
+    pos["close_reason"] = reason
+    pos["close_price"] = close_price
+    pos["closed_at"] = datetime.now(timezone.utc)
+
+    pnl = calculate_pnl(pos)
+    pos["pnl"] = pnl
+
+    print(f"[RESULT] {pos['symbol']} {reason} PnL={pnl}")
+
+    update_after_trade(pnl)
+
+    # Запись закрытия в APEX_MASTER_TRADE (единственный источник правды)
+    try:
+        repo = Repository()
+        trade_id = pos.get("trade_id")
+        if trade_id:
+            entry_price = pos.get("entry_price") or pos.get("entry") or 0
+            pnl_pct = round(pnl * 100, 4) if pnl else 0
+            pnl_usdt = round(pnl * (pos.get("size", 0) * entry_price), 4) if pnl else 0
+            closed_at_str = pos["closed_at"].isoformat() if hasattr(pos["closed_at"], "isoformat") else str(pos["closed_at"])
+
+            repo.log_final_trade({
+                "trade_id": trade_id,
+                "symbol": pos.get("symbol"),
+                "direction": pos.get("direction"),
+                "session_name": pos.get("session_name"),
+                "close_price": close_price,
+                "close_reason": reason,
+                "close_event_type": reason,
+                "closed_at": closed_at_str,
+                "finalized_at": datetime.now(timezone.utc).isoformat(),
+                "pnl_pct": pnl_pct,
+                "pnl_usdt": pnl_usdt,
+                "result_label": "loss" if pnl and pnl < 0 else "profit",
+            })
+    except Exception as e:
+        try:
+            Repository().log_system_event(event="POSITION_MONITOR_ERROR", module="position_monitor", message=f"DB CLOSE ERROR {pos.get('symbol')}: {str(e)}", level="ERROR", traceback=traceback.format_exc())
+        except Exception:
+            pass
+
+
+def _save_live_prices():
+    """Сохранить текущие цены открытых позиций в runtime_state для Telegram."""
+    try:
+        from modules.runtime_state import load_runtime_state, save_runtime_state
+        state = load_runtime_state()
+        state["live_prices"] = {
+            sym: float(pos.get("current_price") or pos.get("entry_price") or 0)
+            for sym, pos in OPEN_POSITIONS.items()
+        }
+        save_runtime_state(state)
+    except Exception:
+        pass
+
+
+def monitor(prices: dict):
+    closed_positions = []
+    to_remove = []
+
+    for symbol, pos in list(OPEN_POSITIONS.items()):
+        price = prices.get(symbol)
+
+        if price is None:
+            price = pos.get("current_price") or pos.get("entry_price")
+
+        pos["current_price"] = price
+
+        reason = should_close(pos, price)
+        if not reason:
+            continue
+
+        close_position(symbol, reason, price)
+        closed_positions.append(pos)
+        to_remove.append(symbol)
+
+    for symbol in to_remove:
+        OPEN_POSITIONS.pop(symbol, None)
+
+    _save_live_prices()
+
+    return closed_positions
+

@@ -12,13 +12,13 @@ from core.time_manager import SessionPhase, get_session_phase
 
 logger = logging.getLogger("apex.risk_manager")
 
-MAX_POSITIONS = 5
+MAX_POSITIONS = 500
 RISK_PER_TRADE = 0.01
 
-MAX_DAILY_LOSS = -50      # USDT
-MAX_TOTAL_LOSS = -200     # USDT
+MAX_DAILY_LOSS = -500     # USDT
+MAX_TOTAL_LOSS = -2000    # USDT
 
-LOSS_STREAK_LIMIT = 3
+LOSS_STREAK_LIMIT = 20
 
 STATE = {
     "daily_pnl": 0.0,
@@ -85,6 +85,14 @@ def reset_daily():
         STATE["last_reset_day"] = today
 
 
+def reset_full():
+    """Полный сброс всех показателей риск-менеджера."""
+    STATE["daily_pnl"]   = 0.0
+    STATE["total_pnl"]   = 0.0
+    STATE["loss_streak"] = 0
+    STATE["blocked"]     = False
+
+
 def update_after_trade(pnl: float):
     reset_daily()
 
@@ -112,27 +120,11 @@ def check_limits():
 
 def can_trade(current_positions: int) -> bool:
     """
-    Главная точка входа для execution_engine.
-    Проверяет:
-    1. Сессионный фильтр (SessionPhase)
-    2. Блокировку по PnL / серии убытков
-    3. Лимит позиций
+    APEX PROTOCOL™ — Risk Manager (TEST MODE)
+    Все фильтры отключены — чистый режим набивки таблиц.
     """
-    reset_daily()
-
-    # 1. Сессионный фильтр
-    session_ok, session_info = check_session_filter()
-    if not session_ok:
-        return False
-
-    # 2. PnL / streak блокировка
-    if STATE["blocked"]:
-        return False
-
-    # 3. Лимит позиций
     if current_positions >= MAX_POSITIONS:
         return False
-
     return True
 
 
